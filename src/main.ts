@@ -1,0 +1,87 @@
+import { NestFactory } from "@nestjs/core";
+import { ValidationPipe, Logger } from "@nestjs/common";
+import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
+import { WINSTON_MODULE_NEST_PROVIDER } from "nest-winston";
+import helmet from "helmet";
+import { AppModule } from "./app.module";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule, {
+    bufferLogs: true,
+  });
+
+  // Use Winston as the application logger
+  app.useLogger(app.get(WINSTON_MODULE_NEST_PROVIDER));
+
+  const logger = new Logger("Bootstrap");
+
+  // Security headers – configure crossOriginResourcePolicy so images (like company logos) can be embedded on localhost:3000/3001
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: "cross-origin" },
+    }),
+  );
+
+  // CORS: allow all origins (*). Auth via Authorization header, bukan cookie.
+  app.enableCors({
+    origin: "*",
+    credentials: false,
+    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+  });
+
+  // Global validation pipe
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+      transformOptions: {
+        enableImplicitConversion: true,
+      },
+    }),
+  );
+
+  // Global prefix for API routes
+  app.setGlobalPrefix("api");
+
+  // Swagger API documentation
+  if (process.env.NODE_ENV !== "production") {
+    const config = new DocumentBuilder()
+      .setTitle("HRMS API")
+      .setDescription("Human Resource Management System API documentation")
+      .setVersion("1.0")
+      .addBearerAuth()
+      .addTag("auth", "Authentication endpoints")
+      .addTag("employees", "Employee management")
+      .addTag("departments", "Department management")
+      .addTag("attendance", "Attendance tracking")
+      .addTag("leave", "Leave management")
+      .addTag("admin", "Admin operations")
+      .addTag("companies", "Company/Tenant management")
+      .addTag("announcements", "Company announcements")
+      .addTag("audit", "Audit logging")
+      .addTag("documents", "Document management")
+      .addTag("expenses", "Expense management")
+      .addTag("holidays", "Holiday management")
+      .addTag("notifications", "Notification system")
+      .addTag("onboarding", "Employee onboarding")
+      .addTag("payroll", "Payroll processing")
+      .addTag("performance", "Performance reviews")
+      .addTag("reports", "Report generation")
+      .addTag("self-service", "Employee self-service")
+      .addTag("shifts", "Shift management")
+      .addTag("uploads", "File uploads")
+      .build();
+
+    const document = SwaggerModule.createDocument(app, config);
+    SwaggerModule.setup("api/docs", app, document);
+    logger.log("Swagger docs available at /api/docs");
+  }
+
+  const port = process.env.PORT || 3001;
+  await app.listen(port);
+  logger.log(`HRMS Backend running on http://localhost:${port}`);
+}
+
+bootstrap();
