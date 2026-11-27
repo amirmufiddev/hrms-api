@@ -1,0 +1,490 @@
+Commits: none. Task 6 files.
+
+diff --git a/backend/src/common/queue/queue.module.ts b/backend/src/common/queue/queue.module.ts
+index 7c57f43..8d04fda 100644
+--- a/backend/src/common/queue/queue.module.ts
++++ b/backend/src/common/queue/queue.module.ts
+@@ -31,15 +31,16 @@ export class QueueModule {
+             },
+           }),
+           inject: [ConfigService],
+         }),
+         BullModule.registerQueue(
+           { name: 'email' },
+           { name: 'reports' },
+           { name: 'payroll' },
++          { name: 'employee-import' },
+         ),
+       ],
+       providers: [EmailProcessor],
+       exports: [BullModule],
+     };
+   }
+ }
+diff --git a/backend/src/modules/employees/employees.module.ts b/backend/src/modules/employees/employees.module.ts
+index 3deac7a..88fba83 100644
+--- a/backend/src/modules/employees/employees.module.ts
++++ b/backend/src/modules/employees/employees.module.ts
+@@ -1,24 +1,42 @@
+ import { Module } from '@nestjs/common';
++import { BullModule } from '@nestjs/bullmq';
+ import { AttendanceModule } from '../attendance/attendance.module';
+ import { EmployeesController } from './employees.controller';
+ import { EmployeesService } from './employees.service';
+ import { CardEnrollmentService } from './card-enrollment.service';
+ import {
+   CardEnrollmentCommandController,
+   CardEnrollmentQueryController,
+ } from './card-enrollment.controller';
+ import { AttendanceDeskController } from '../attendance/device/attendance-desk.controller';
+ import { AttendanceDeskService } from '../attendance/device/attendance-desk.service';
++import { EmployeeImportController } from './import/employee-import.controller';
++import { EmployeeImportService } from './import/employee-import.service';
++import { EmployeeImportProcessor } from './import/employee-import.processor';
++
++const redisEnabled = process.env.REDIS_ENABLED === 'true';
+ 
+ @Module({
+-  imports: [AttendanceModule],
++  imports: [
++    AttendanceModule,
++    ...(redisEnabled
++      ? [BullModule.registerQueue({ name: 'employee-import' })]
++      : []),
++  ],
+   controllers: [
+     EmployeesController,
++    ...(redisEnabled ? [EmployeeImportController] : []),
+     CardEnrollmentQueryController,
+     CardEnrollmentCommandController,
+     AttendanceDeskController,
+   ],
+-  providers: [EmployeesService, CardEnrollmentService, AttendanceDeskService],
++  providers: [
++    EmployeesService,
++    CardEnrollmentService,
++    AttendanceDeskService,
++    EmployeeImportService,
++    ...(redisEnabled ? [EmployeeImportProcessor] : []),
++  ],
+   exports: [EmployeesService, CardEnrollmentService],
+ })
+ export class EmployeesModule {}
+
+===== backend/src/modules/employees/import/employee-import.controller.ts =====
+import {
+  BadRequestException,
+  ConflictException,
+  Controller,
+  Get,
+  NotFoundException,
+  Param,
+  Post,
+  Body,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+  Res,
+} from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Queue } from 'bullmq';
+import * as ExcelJS from 'exceljs';
+import { mkdir, unlink, writeFile } from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+import { randomUUID } from 'crypto';
+import { Response } from 'express';
+import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
+import { PermissionsGuard } from '../../../common/guards/permissions.guard';
+import { RequirePermissions } from '../../../common/decorators/permissions.decorator';
+import { CurrentUser } from '../../../common/decorators/current-user.decorator';
+import { AuthenticatedUser } from '../../../common/types/jwt-payload.type';
+import { assertNikPrefix } from './nik-sequence';
+import { buildEmployeeImportTemplate } from './employee-import-template';
+import {
+  EmployeeImportJobData,
+  IMPORT_HEADERS,
+  normalizeImportProgress,
+} from './employee-import.types';
+
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_DATA_ROWS = 5000;
+
+function isBlankDataRow(cells: string[]): boolean {
+  return cells.every((c) => c === '');
+}
+
+async function countNonEmptyDataRows(buffer: Buffer): Promise<number> {
+  const workbook = new ExcelJS.Workbook();
+  try {
+    await workbook.xlsx.load(
+      buffer as unknown as Awaited<
+        ReturnType<InstanceType<typeof ExcelJS.Workbook>['xlsx']['writeBuffer']>
+      >,
+    );
+  } catch {
+    return 0;
+  }
+  const sheet = workbook.getWorksheet('Data');
+  if (!sheet) {
+    return 0;
+  }
+  let count = 0;
+  sheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) {
+      return;
+    }
+    const values = row.values;
+    const rawRow = Array.isArray(values) ? values.slice(1) : [];
+    const cells = IMPORT_HEADERS.map((_, col) => {
+      const cell = rawRow[col];
+      return cell == null ? '' : String(cell).trim();
+    });
+    if (!isBlankDataRow(cells)) {
+      count++;
+    }
+  });
+  return count;
+}
+
+@ApiTags('employees')
+@ApiBearerAuth()
+@Controller('employees/import')
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+export class EmployeeImportController {
+  constructor(
+    @InjectQueue('employee-import') private readonly queue: Queue<EmployeeImportJobData>,
+  ) {}
+
+  @Get('template')
+  @ApiOperation({ summary: 'Download employee import spreadsheet template' })
+  @RequirePermissions('employees:create')
+  async downloadTemplate(@Res() res: Response): Promise<void> {
+    const buffer = await buildEmployeeImportTemplate();
+    res.set({
+      'Content-Type':
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': 'attachment; filename="template-import-karyawan.xlsx"',
+      'Content-Length': buffer.length,
+    });
+    res.end(buffer);
+  }
+
+  @Post()
+  @ApiOperation({ summary: 'Enqueue employee spreadsheet import' })
+  @RequirePermissions('employees:create')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      limits: { fileSize: MAX_FILE_BYTES },
+    }),
+  )
+  async enqueue(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() body: { nikPrefix: string },
+    @UploadedFile() file: Express.Multer.File,
+  ): Promise<{ jobId: string }> {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('File impor wajib diunggah');
+    }
+
+    const originalName = file.originalname ?? '';
+    if (!/\.xlsx$/i.test(originalName)) {
+      throw new BadRequestException('File harus berformat .xlsx');
+    }
+
+    let nikPrefix: string;
+    try {
+      nikPrefix = assertNikPrefix(body.nikPrefix ?? '');
+    } catch (err) {
+      throw new BadRequestException(
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+
+    const waitingOrActive = await this.queue.getJobs(['waiting', 'active']);
+    for (const job of waitingOrActive) {
+      if (job.data?.tenantId !== user.tenantId) {
+        continue;
+      }
+      const state = await job.getState();
+      const progress = normalizeImportProgress(job.progress);
+      throw new ConflictException({ jobId: job.id, state, progress });
+    }
+
+    const dir = path.join(os.tmpdir(), 'hrms-employee-import');
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, `${randomUUID()}.xlsx`);
+    await writeFile(filePath, file.buffer);
+
+    const rowCount = await countNonEmptyDataRows(file.buffer);
+    if (rowCount > MAX_DATA_ROWS) {
+      await unlink(filePath).catch(() => undefined);
+      throw new BadRequestException(
+        `Maksimal ${MAX_DATA_ROWS} baris data per file impor`,
+      );
+    }
+
+    const job = await this.queue.add('import', {
+      tenantId: user.tenantId,
+      filePath,
+      nikPrefix,
+    });
+
+    return { jobId: String(job.id) };
+  }
+
+  @Get(':jobId')
+  @ApiOperation({ summary: 'Get employee import job status' })
+  @RequirePermissions('employees:create')
+  async getJobStatus(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('jobId') jobId: string,
+  ): Promise<{ jobId: string; state: string; progress: ReturnType<typeof normalizeImportProgress> }> {
+    const job = await this.queue.getJob(jobId);
+    if (!job || job.data?.tenantId !== user.tenantId) {
+      throw new NotFoundException('Job impor tidak ditemukan');
+    }
+
+    const state = await job.getState();
+    if (!['waiting', 'active', 'completed', 'failed'].includes(state)) {
+      throw new NotFoundException('Job impor tidak ditemukan');
+    }
+
+    return {
+      jobId: String(job.id),
+      state,
+      progress: normalizeImportProgress(job.progress),
+    };
+  }
+}
+
+===== backend/src/modules/employees/import/employee-import.processor.ts =====
+import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { Logger } from '@nestjs/common';
+import { Job } from 'bullmq';
+import * as ExcelJS from 'exceljs';
+import { unlink } from 'fs/promises';
+import { PrismaService } from '../../../prisma/prisma.service';
+import { assertImportHeaders, parseEmployeeSheet } from './employee-import-parser';
+import { EmployeeImportService } from './employee-import.service';
+import type {
+  EmployeeImportJobData,
+  EmployeeImportProgress,
+} from './employee-import.types';
+
+function worksheetToRows(sheet: ExcelJS.Worksheet): unknown[][] {
+  const rows: unknown[][] = [];
+  sheet.eachRow((row) => {
+    const values = row.values;
+    if (Array.isArray(values)) {
+      rows.push(values.slice(1));
+    } else {
+      rows.push([]);
+    }
+  });
+  return rows;
+}
+
+@Processor('employee-import')
+export class EmployeeImportProcessor extends WorkerHost {
+  private readonly logger = new Logger(EmployeeImportProcessor.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly employeeImportService: EmployeeImportService,
+  ) {
+    super();
+  }
+
+  async process(job: Job<EmployeeImportJobData>): Promise<void> {
+    const { tenantId, filePath, nikPrefix } = job.data;
+    this.logger.debug(`Processing employee import job ${job.id} for tenant ${tenantId}`);
+
+    try {
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.readFile(filePath);
+
+      const sheet = workbook.getWorksheet('Data');
+      if (!sheet) {
+        throw new Error('Sheet Data tidak ditemukan');
+      }
+
+      const rows = worksheetToRows(sheet);
+      const headerRow = rows[0] ?? [];
+      assertImportHeaders(headerRow);
+
+      const departments = await this.prisma.department.findMany({
+        where: { tenantId },
+        select: { id: true, name: true, code: true },
+      });
+
+      const parsed = parseEmployeeSheet(rows, departments);
+      const total = parsed.rows.length + parsed.errors.length;
+
+      const afterParse: EmployeeImportProgress = {
+        total,
+        processed: total,
+        created: 0,
+        failed: parsed.errors.length,
+        errors: [...parsed.errors],
+      };
+      await job.updateProgress(afterParse);
+
+      const emails = parsed.rows
+        .map((row) => row.email)
+        .filter((email): email is string => email != null && email !== '');
+
+      const existingRecords =
+        emails.length === 0
+          ? []
+          : await this.prisma.employee.findMany({
+              where: { tenantId, email: { in: emails } },
+              select: { email: true },
+            });
+
+      const existingEmails = new Set(
+        existingRecords
+          .map((record) => record.email?.toLowerCase())
+          .filter((email): email is string => email != null),
+      );
+
+      const importResult = await this.employeeImportService.importRows(
+        tenantId,
+        nikPrefix,
+        parsed.rows,
+        existingEmails,
+      );
+
+      const combinedErrors = [...parsed.errors, ...importResult.errors];
+      const afterImport: EmployeeImportProgress = {
+        total,
+        processed: total,
+        created: importResult.created,
+        failed: parsed.errors.length + importResult.failed,
+        errors: combinedErrors,
+      };
+      await job.updateProgress(afterImport);
+    } catch (error) {
+      this.logger.error(
+        `Employee import job ${job.id} failed: ${error instanceof Error ? error.message : error}`,
+      );
+      throw error;
+    } finally {
+      await unlink(filePath).catch(() => undefined);
+    }
+  }
+}
+
+===== backend/src/modules/employees/import/employee-import.controller.spec.ts =====
+import { ConflictException } from '@nestjs/common';
+import { getQueueToken } from '@nestjs/bullmq';
+import { Test } from '@nestjs/testing';
+import { EmployeeImportController } from './employee-import.controller';
+import { overrideJwtAuthGuard } from '../../../test/helpers';
+
+describe('EmployeeImportController', () => {
+  const queue = {
+    add: jest.fn().mockResolvedValue({ id: 'job-1' }),
+    getJobs: jest.fn().mockResolvedValue([]),
+    getJob: jest.fn(),
+  };
+
+  it('returns the job id without importing rows', async () => {
+    const module = await overrideJwtAuthGuard(
+      Test.createTestingModule({
+        controllers: [EmployeeImportController],
+        providers: [{ provide: getQueueToken('employee-import'), useValue: queue }],
+      }),
+    ).compile();
+    const controller = module.get(EmployeeImportController);
+
+    await expect(
+      controller.enqueue(
+        { tenantId: 'tenant-1' } as never,
+        { nikPrefix: '90' },
+        {
+          buffer: Buffer.from('xlsx'),
+          originalname: 'karyawan.xlsx',
+          size: 4,
+          mimetype: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        } as never,
+      ),
+    ).resolves.toEqual({ jobId: 'job-1' });
+    expect(queue.add).toHaveBeenCalledWith(
+      'import',
+      expect.objectContaining({ tenantId: 'tenant-1', nikPrefix: '90' }),
+    );
+  });
+
+  it('rejects a second active import for the same tenant', async () => {
+    queue.getJobs.mockResolvedValueOnce([
+      { id: 'job-9', data: { tenantId: 'tenant-1' }, getState: async () => 'active' },
+    ]);
+    const module = await overrideJwtAuthGuard(
+      Test.createTestingModule({
+        controllers: [EmployeeImportController],
+        providers: [{ provide: getQueueToken('employee-import'), useValue: queue }],
+      }),
+    ).compile();
+    const controller = module.get(EmployeeImportController);
+
+    await expect(
+      controller.enqueue({ tenantId: 'tenant-1' } as never, { nikPrefix: '90' }, {
+        buffer: Buffer.from('xlsx'),
+        originalname: 'karyawan.xlsx',
+        size: 4,
+      } as never),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+});
+
+===== backend/src/modules/employees/import/employee-import.processor.spec.ts =====
+import { EmployeeImportProcessor } from './employee-import.processor';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+import * as ExcelJS from 'exceljs';
+import { EmployeeImportService } from './employee-import.service';
+import { PrismaService } from '../../../prisma/prisma.service';
+
+describe('EmployeeImportProcessor', () => {
+  const importRows = jest.fn();
+  const prisma = {
+    department: { findMany: jest.fn().mockResolvedValue([]) },
+    employee: { findMany: jest.fn().mockResolvedValue([]) },
+  };
+
+  let processor: EmployeeImportProcessor;
+
+  beforeEach(() => {
+    importRows.mockReset();
+    processor = new EmployeeImportProcessor(
+      prisma as unknown as PrismaService,
+      { importRows } as unknown as EmployeeImportService,
+    );
+  });
+
+  it('deletes the file and throws on invalid headers before importRows', async () => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Data');
+    sheet.addRow(['Salah', 'Header']);
+
+    const filePath = path.join(os.tmpdir(), `hrms-import-test-${Date.now()}.xlsx`);
+    await workbook.xlsx.writeFile(filePath);
+
+    const job = {
+      id: 'job-1',
+      data: { tenantId: 'tenant-1', filePath, nikPrefix: '90' },
+      updateProgress: jest.fn(),
+    };
+
+    await expect(processor.process(job as never)).rejects.toThrow(
+      'Header sheet Data tidak sesuai template',
+    );
+    await expect(fs.access(filePath)).rejects.toThrow();
+    expect(importRows).not.toHaveBeenCalled();
+  });
+});
+

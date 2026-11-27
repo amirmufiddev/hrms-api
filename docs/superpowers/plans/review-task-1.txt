@@ -1,0 +1,66 @@
+Commits: none (user forbade commits). Diff is working tree vs 275ab109e6b92540e0e44aff2efec2c5558280f3
+
+Stat:
+ backend/prisma/schema.prisma | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+Diff:
+diff --git a/backend/prisma/schema.prisma b/backend/prisma/schema.prisma
+index 9d8c806..64d0f54 100644
+--- a/backend/prisma/schema.prisma
++++ b/backend/prisma/schema.prisma
+@@ -254,21 +254,21 @@ enum EmployeeStatus {
+   ACTIVE
+   INACTIVE
+ }
+ 
+ model Employee {
+   id             String         @id @default(uuid())
+   tenantId       String
+   employeeCode   String
+   firstName      String
+   lastName       String
+-  email          String
++  email          String?
+   ssoUserId      String?        @unique
+   phone          String?
+   salutation     String?
+   gender         String?
+   dateOfBirth    DateTime?
+   fatherName     String?
+   aadhaarNumber  String?
+   ktpNumber      String?
+   nationality    String?
+   maritalStatus  String?
+
+Untracked:
+
+===== untracked .superpowers/sdd/progress.md =====
+diff --git a/.superpowers/sdd/progress.md b/.superpowers/sdd/progress.md
+new file
+# SDD progress — employee excel import
+
+Base: 275ab109e6b92540e0e44aff2efec2c5558280f3
+Branch: feature/hrms-sso
+Commits: disabled by user (manual commit later)
+
+
+===== untracked backend/prisma/migrations/20261103210000_employee_email_optional/migration.sql =====
+diff --git a/backend/prisma/migrations/20261103210000_employee_email_optional/migration.sql b/backend/prisma/migrations/20261103210000_employee_email_optional/migration.sql
+new file
+ALTER TABLE "employees" ALTER COLUMN "email" DROP NOT NULL;
+
+===== untracked backend/src/modules/employees/import/employee-email-optional.spec.ts =====
+diff --git a/backend/src/modules/employees/import/employee-email-optional.spec.ts b/backend/src/modules/employees/import/employee-email-optional.spec.ts
+new file
+import { Prisma } from '@prisma/client';
+
+describe('Employee.email', () => {
+  it('is optional on the Prisma model', () => {
+    const field = Prisma.dmmf.datamodel.models
+      .find((model) => model.name === 'Employee')
+      ?.fields.find((item) => item.name === 'email');
+
+    expect(field?.isRequired).toBe(false);
+  });
+});

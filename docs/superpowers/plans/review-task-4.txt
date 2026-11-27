@@ -1,0 +1,78 @@
+Commits: none. Task 4 after return-type fix.
+
+diff --git a/backend/package.json b/backend/package.json
+index e9a2c6b..1473f78 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -96,11 +96,18 @@
+       "ts"
+     ],
+     "rootDir": "src",
+     "testRegex": ".*\\.spec\\.ts$",
+     "transform": {
+-      "^.+\\.(t|j)s$": "ts-jest"
++      "^.+\\.(t|j)s$": [
++        "ts-jest",
++        {
++          "tsconfig": {
++            "esModuleInterop": true
++          }
++        }
++      ]
+     },
+     "collectCoverageFrom": [
+       "**/*.(t|j)s"
+     ],
+     "coverageDirectory": "../coverage",
+
+===== backend/src/modules/employees/import/employee-import-template.ts =====
+import * as ExcelJS from 'exceljs';
+import { IMPORT_HEADERS } from './employee-import.types';
+
+export async function buildEmployeeImportTemplate(): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+
+  const dataSheet = workbook.addWorksheet('Data');
+  dataSheet.addRow([...IMPORT_HEADERS]);
+
+  const sampleSheet = workbook.addWorksheet('Contoh');
+  sampleSheet.addRow([...IMPORT_HEADERS]);
+  sampleSheet.addRow([
+    'Amir',
+    'Mufid',
+    'Engineering',
+    'PERMANENT',
+    'amir@eiger.test',
+    '08123456789',
+    '2026-01-15',
+  ]);
+
+  const xlsxBuffer = await workbook.xlsx.writeBuffer();
+  return Buffer.from(xlsxBuffer) as Buffer;
+}
+
+===== backend/src/modules/employees/import/employee-import-template.spec.ts =====
+import ExcelJS from 'exceljs';
+import { buildEmployeeImportTemplate } from './employee-import-template';
+import { IMPORT_HEADERS } from './employee-import.types';
+
+describe('buildEmployeeImportTemplate', () => {
+  it('writes headers on Data and one sample on Contoh', async () => {
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(
+      (await buildEmployeeImportTemplate()) as unknown as Awaited<
+        ReturnType<InstanceType<typeof ExcelJS.Workbook>['xlsx']['writeBuffer']>
+      >,
+    );
+
+    const data = workbook.getWorksheet('Data');
+    const sample = workbook.getWorksheet('Contoh');
+    const headers = IMPORT_HEADERS.map((_, index) => data?.getRow(1).getCell(index + 1).value);
+
+    expect(headers).toEqual([...IMPORT_HEADERS]);
+    expect(data?.rowCount).toBe(1);
+    expect(sample?.getRow(2).getCell(1).value).toBe('Amir');
+    expect(sample?.getRow(2).getCell(4).value).toBe('PERMANENT');
+  });
+});
+

@@ -1,0 +1,300 @@
+Commits: none. Task 3 files after fix.
+
+===== backend/src/modules/employees/import/employee-import.types.ts =====
+new file
+export const IMPORT_HEADERS = [
+  'Nama depan',
+  'Nama belakang',
+  'Departemen',
+  'Tipe kerja',
+  'Email',
+  'Telepon',
+  'Tanggal bergabung',
+] as const;
+
+export const EMPLOYMENT_TYPES = [
+  'PERMANENT',
+  'CONTRACT',
+  'TEMPORARY',
+  'INTERN',
+  'DAILY_WORKER',
+] as const;
+
+export type EmploymentTypeValue = (typeof EMPLOYMENT_TYPES)[number];
+
+export type ParsedEmployeeRow = {
+  row: number;
+  firstName: string;
+  lastName: string;
+  departmentId: string;
+  employmentType: EmploymentTypeValue;
+  email: string | null;
+  phone: string | null;
+  joinDate: string | null;
+};
+
+export type ImportRowError = { row: number; message: string };
+
+===== backend/src/modules/employees/import/employee-import-parser.ts =====
+new file
+import {
+  EMPLOYMENT_TYPES,
+  IMPORT_HEADERS,
+  type EmploymentTypeValue,
+  type ImportRowError,
+  type ParsedEmployeeRow,
+} from './employee-import.types';
+
+const HEADER_ERROR = 'Header sheet Data tidak sesuai template';
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export { IMPORT_HEADERS, type ParsedEmployeeRow } from './employee-import.types';
+
+export function assertImportHeaders(header: unknown[]): void {
+  for (let i = 0; i < IMPORT_HEADERS.length; i++) {
+    const cell = header[i];
+    const value = cell == null ? '' : String(cell).trim();
+    if (value !== IMPORT_HEADERS[i]) {
+      throw new Error(HEADER_ERROR);
+    }
+  }
+}
+
+function cellString(value: unknown): string {
+  if (value == null) {
+    return '';
+  }
+  return String(value).trim();
+}
+
+function isBlankRow(cells: string[]): boolean {
+  return cells.every((c) => c === '');
+}
+
+function findDepartmentId(
+  raw: string,
+  departments: { id: string; name: string; code: string }[],
+): string | null {
+  if (raw === '') {
+    return null;
+  }
+  const byCode = departments.find((d) => d.code === raw);
+  if (byCode) {
+    return byCode.id;
+  }
+  const lower = raw.toLowerCase();
+  const byName = departments.find((d) => d.name.trim().toLowerCase() === lower);
+  return byName?.id ?? null;
+}
+
+function parseEmploymentType(raw: string): EmploymentTypeValue | null {
+  if (raw === '') {
+    return null;
+  }
+  if ((EMPLOYMENT_TYPES as readonly string[]).includes(raw)) {
+    return raw as EmploymentTypeValue;
+  }
+  return null;
+}
+
+function parseJoinDate(raw: string): string | null | 'invalid' {
+  if (raw === '') {
+    return null;
+  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (!match) {
+    return 'invalid';
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const utc = Date.UTC(year, month - 1, day);
+  const d = new Date(utc);
+  if (
+    d.getUTCFullYear() !== year ||
+    d.getUTCMonth() !== month - 1 ||
+    d.getUTCDate() !== day
+  ) {
+    return 'invalid';
+  }
+  return raw;
+}
+
+export function jakartaJoinDate(now: Date = new Date()): Date {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jakarta',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const parts = formatter.formatToParts(now);
+  const year = parts.find((p) => p.type === 'year')?.value ?? '1970';
+  const month = parts.find((p) => p.type === 'month')?.value ?? '01';
+  const day = parts.find((p) => p.type === 'day')?.value ?? '01';
+  return new Date(`${year}-${month}-${day}T00:00:00.000Z`);
+}
+
+export function parseEmployeeSheet(
+  rows: unknown[][],
+  departments: { id: string; name: string; code: string }[],
+): { rows: ParsedEmployeeRow[]; errors: ImportRowError[] } {
+  if (rows.length === 0) {
+    throw new Error(HEADER_ERROR);
+  }
+
+  assertImportHeaders(rows[0]);
+
+  const parsedRows: ParsedEmployeeRow[] = [];
+  const errors: ImportRowError[] = [];
+  const seenEmails = new Set<string>();
+
+  for (let i = 1; i < rows.length; i++) {
+    const sheetRow = i + 1;
+    const rawRow = rows[i] ?? [];
+    const cells = IMPORT_HEADERS.map((_, col) => cellString(rawRow[col]));
+
+    if (isBlankRow(cells)) {
+      continue;
+    }
+
+    const messages: string[] = [];
+
+    const firstName = cells[0];
+    const lastName = cells[1];
+    const departmentRaw = cells[2];
+    const employmentRaw = cells[3];
+    const emailRaw = cells[4];
+    const phoneRaw = cells[5];
+    const joinDateRaw = cells[6];
+
+    if (firstName === '') {
+      messages.push('Nama depan wajib diisi');
+    }
+    if (lastName === '') {
+      messages.push('Nama belakang wajib diisi');
+    }
+
+    const departmentId = findDepartmentId(departmentRaw, departments);
+    if (departmentId == null) {
+      messages.push('Departemen tidak ditemukan');
+    }
+
+    const employmentType = parseEmploymentType(employmentRaw);
+    if (employmentType == null) {
+      messages.push('Tipe kerja tidak valid');
+    }
+
+    let email: string | null = null;
+    if (emailRaw === '') {
+      email = null;
+    } else if (!EMAIL_REGEX.test(emailRaw)) {
+      messages.push('Email tidak valid');
+    } else {
+      const normalized = emailRaw.toLowerCase();
+      if (seenEmails.has(normalized)) {
+        messages.push('Email sudah dipakai');
+      } else {
+        email = emailRaw;
+      }
+    }
+
+    const phone = phoneRaw === '' ? null : phoneRaw;
+
+    const joinDateResult = parseJoinDate(joinDateRaw);
+    let joinDate: string | null = null;
+    if (joinDateResult === 'invalid') {
+      messages.push('Tanggal bergabung tidak valid');
+    } else {
+      joinDate = joinDateResult;
+    }
+
+    if (messages.length > 0) {
+      errors.push({ row: sheetRow, message: messages.join('; ') });
+      continue;
+    }
+
+    parsedRows.push({
+      row: sheetRow,
+      firstName,
+      lastName,
+      departmentId: departmentId!,
+      employmentType: employmentType!,
+      email,
+      phone,
+      joinDate,
+    });
+    if (email != null) {
+      seenEmails.add(email.toLowerCase());
+    }
+  }
+
+  return { rows: parsedRows, errors };
+}
+
+===== backend/src/modules/employees/import/employee-import-parser.spec.ts =====
+new file
+import { assertImportHeaders, parseEmployeeSheet } from './employee-import-parser';
+
+const departments = [{ id: 'dept-1', name: 'Engineering', code: 'ENG' }];
+
+describe('parseEmployeeSheet', () => {
+  const header = [
+    'Nama depan',
+    'Nama belakang',
+    'Departemen',
+    'Tipe kerja',
+    'Email',
+    'Telepon',
+    'Tanggal bergabung',
+  ];
+
+  it('rejects a header that does not match the template', () => {
+    expect(() => assertImportHeaders(['Nama'])).toThrow('Header sheet Data tidak sesuai template');
+  });
+
+  it('parses a valid row and skips a blank row', () => {
+    const result = parseEmployeeSheet(
+      [
+        header,
+        ['Amir', 'Mufid', 'ENG', 'PERMANENT', '', '0812', ''],
+        ['', '', '', '', '', '', ''],
+        ['Budi', 'Santoso', 'Tidak Ada', 'MAGIC', 'budi@eiger.test', '', '2026-01-15'],
+      ],
+      departments,
+    );
+
+    expect(result.rows).toEqual([
+      expect.objectContaining({
+        row: 2,
+        firstName: 'Amir',
+        lastName: 'Mufid',
+        departmentId: 'dept-1',
+        employmentType: 'PERMANENT',
+        email: null,
+        phone: '0812',
+        joinDate: null,
+      }),
+    ]);
+    expect(result.errors.map((error) => error.row)).toEqual([4]);
+    expect(result.errors[0].message).toContain('Departemen tidak ditemukan');
+    expect(result.errors[0].message).toContain('Tipe kerja tidak valid');
+  });
+
+  it('rejects a duplicate email inside the same file on the second row', () => {
+    const result = parseEmployeeSheet(
+      [
+        header,
+        ['Amir', 'Mufid', 'engineering', 'CONTRACT', 'amir@eiger.test', '', '2026-02-01'],
+        ['Sari', 'Putri', 'Engineering', 'INTERN', 'amir@eiger.test', '', ''],
+      ],
+      departments,
+    );
+
+    expect(result.rows).toHaveLength(1);
+    expect(result.errors[0]).toEqual({
+      row: 3,
+      message: 'Email sudah dipakai',
+    });
+  });
+});
+

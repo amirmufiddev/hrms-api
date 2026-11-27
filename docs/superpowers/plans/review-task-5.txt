@@ -1,0 +1,179 @@
+Commits: none. Task 5 files.
+
+===== backend/src/modules/employees/import/employee-import.service.ts =====
+import { PrismaService } from '../../../prisma/prisma.service';
+import { jakartaJoinDate } from './employee-import-parser';
+import type { ParsedEmployeeRow } from './employee-import.types';
+import { nextEmployeeCode } from './nik-sequence';
+
+export class EmployeeImportService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async importRows(
+    tenantId: string,
+    prefix: string,
+    rows: ParsedEmployeeRow[],
+    existingEmails: Set<string>,
+  ): Promise<{ created: number; failed: number; errors: { row: number; message: string }[] }> {
+    const stored = await this.prisma.employee.findMany({
+      where: {
+        tenantId,
+        employeeCode: { startsWith: prefix },
+      },
+      select: { employeeCode: true },
+    });
+    const existingCodes = stored.map((e) => e.employeeCode);
+
+    let created = 0;
+    let failed = 0;
+    const errors: { row: number; message: string }[] = [];
+
+    for (const row of rows) {
+      if (row.email) {
+        if (existingEmails.has(row.email)) {
+          failed++;
+          errors.push({ row: row.row, message: 'Email sudah dipakai' });
+          continue;
+        }
+        const duplicate = await this.prisma.employee.findFirst({
+          where: { tenantId, email: row.email },
+        });
+        if (duplicate) {
+          failed++;
+          errors.push({ row: row.row, message: 'Email sudah dipakai' });
+          continue;
+        }
+      }
+
+      let employeeCode: string;
+      try {
+        employeeCode = nextEmployeeCode(prefix, existingCodes);
+      } catch (err) {
+        failed++;
+        errors.push({
+          row: row.row,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+
+      const joinDate = row.joinDate
+        ? new Date(`${row.joinDate}T00:00:00.000Z`)
+        : jakartaJoinDate();
+
+      try {
+        await this.prisma.employee.create({
+          data: {
+            tenantId,
+            employeeCode,
+            firstName: row.firstName,
+            lastName: row.lastName,
+            email: row.email,
+            phone: row.phone,
+            departmentId: row.departmentId,
+            employmentType: row.employmentType,
+            joinDate,
+            status: 'ACTIVE',
+            ssoUserId: null,
+          },
+        });
+        existingCodes.push(employeeCode);
+        created++;
+      } catch (err) {
+        failed++;
+        errors.push({
+          row: row.row,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return { created, failed, errors };
+  }
+}
+
+===== backend/src/modules/employees/import/employee-import.service.spec.ts =====
+import { EmployeeImportService } from './employee-import.service';
+
+describe('EmployeeImportService.importRows', () => {
+  const prisma = {
+    employee: {
+      findMany: jest.fn().mockResolvedValue([{ employeeCode: '900042' }]),
+      findFirst: jest.fn().mockResolvedValue(null),
+      create: jest.fn().mockResolvedValue({ id: 'emp-1' }),
+    },
+  };
+
+  it('creates the next code and stores a null email', async () => {
+    const service = new EmployeeImportService(prisma as never);
+    const result = await service.importRows(
+      'tenant-1',
+      '90',
+      [
+        {
+          row: 2,
+          firstName: 'Amir',
+          lastName: 'Mufid',
+          departmentId: 'dept-1',
+          employmentType: 'PERMANENT',
+          email: null,
+          phone: null,
+          joinDate: null,
+        },
+      ],
+      new Set(),
+    );
+
+    expect(result.created).toBe(1);
+    expect(prisma.employee.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          tenantId: 'tenant-1',
+          employeeCode: '900043',
+          email: null,
+          ssoUserId: null,
+          departmentId: 'dept-1',
+          employmentType: 'PERMANENT',
+          status: 'ACTIVE',
+        }),
+      }),
+    );
+  });
+
+  it('records a row failure when the email already exists and continues', async () => {
+    prisma.employee.findFirst.mockResolvedValueOnce({ id: 'existing' });
+    const service = new EmployeeImportService(prisma as never);
+    const result = await service.importRows(
+      'tenant-1',
+      '90',
+      [
+        {
+          row: 2,
+          firstName: 'Amir',
+          lastName: 'Mufid',
+          departmentId: 'dept-1',
+          employmentType: 'PERMANENT',
+          email: 'amir@eiger.test',
+          phone: null,
+          joinDate: '2026-01-15',
+        },
+        {
+          row: 3,
+          firstName: 'Sari',
+          lastName: 'Putri',
+          departmentId: 'dept-1',
+          employmentType: 'INTERN',
+          email: null,
+          phone: null,
+          joinDate: null,
+        },
+      ],
+      new Set(['amir@eiger.test']),
+    );
+
+    expect(result.failed).toBe(1);
+    expect(result.created).toBe(1);
+    expect(result.errors[0].message).toBe('Email sudah dipakai');
+  });
+});
+

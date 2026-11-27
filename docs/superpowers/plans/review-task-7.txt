@@ -1,0 +1,443 @@
+Commits: none. Task 7 files.
+
+diff --git a/frontend/src/app/(protected)/employees/page.tsx b/frontend/src/app/(protected)/employees/page.tsx
+index cf0a61d..15e858c 100644
+--- a/frontend/src/app/(protected)/employees/page.tsx
++++ b/frontend/src/app/(protected)/employees/page.tsx
+@@ -3,25 +3,27 @@
+ import React, { useEffect, useState, useCallback } from 'react';
+ import { useRouter } from 'next/navigation';
+ import { 
+   Card, CardHeader, CardTitle, CardContent,
+   Table, TableHeader, TableBody, TableRow, TableHead, TableCell, TableEmptyState, TableLoadingState,
+   Badge, getStatusBadgeVariant, Select, Input, Button,
+   Modal, ModalFooter, FormRow, FormGrid, FormError, FormSuccess
+ } from '@/components/ui';
+-import { Search, Plus, Eye, Edit2, Trash2, UserPlus, Phone, Mail, Calendar, Building2, Users, Download, Filter, X, ChevronDown, ChevronUp, ShieldCheck } from 'lucide-react';
++import { Search, Plus, Eye, Edit2, Trash2, UserPlus, Phone, Mail, Calendar, Building2, Users, Download, Filter, X, ChevronDown, ChevronUp, ShieldCheck, Upload } from 'lucide-react';
+ import { employeesApi, departmentsApi, designationsApi } from '@/lib/api';
+ import { Employee, Department, Designation, EmploymentType, EmployeeStatus, PayType } from '@/types';
+ import { EMPLOYEE_TYPE_OPTIONS } from '@/lib/employee-type-options';
+ import { parseAmountToNumber } from '@/lib/input-mask';
+ import { useAuth } from '@/contexts/AuthContext';
+ import { Can } from '@/components/Can';
+ import { OrganizationFields } from '@/components/employees/OrganizationFields';
++import { EmployeeImportDialog } from '@/components/employees/EmployeeImportDialog';
+ import { resolveOrgSelection, toPersistedDepartmentId } from '@/components/employees/org-fields';
++import { downloadBlob } from '@/lib/download-blob';
+ import {
+   employeeCodeHint,
+   isValidEmployeeCode,
+   KTP_NUMBER_REGEX,
+   normalizeKtpInput,
+ } from '@/lib/employee-code';
+ 
+ // Types for form data
+@@ -100,16 +102,19 @@ export default function EmployeesPage() {
+   const [ssoActionError, setSsoActionError] = useState('');
+   const [ssoCreatingId, setSsoCreatingId] = useState<string | null>(null);
+   const [formSuccess, setFormSuccess] = useState('');
+   const [formLoading, setFormLoading] = useState(false);
+ 
+   // Expanded row for quick view
+   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+ 
++  const [importDialogOpen, setImportDialogOpen] = useState(false);
++  const [importJobId, setImportJobId] = useState('');
++
+   useEffect(() => {
+     loadDepartments();
+     loadDesignations();
+     loadAllEmployees();
+   }, []);
+ 
+   useEffect(() => {
+     loadEmployees();
+@@ -495,16 +500,34 @@ export default function EmployeesPage() {
+       {/* Header */}
+       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4">
+         <div>
+           <h1 className="text-xl sm:text-2xl font-bold text-warm-900">Employees</h1>
+           <p className="text-warm-500">Manage and view employee information</p>
+         </div>
+         <div className="flex gap-2">
+           <Can permission="employees:create">
++            <Button
++              variant="outline"
++              onClick={async () => {
++                try {
++                  const response = await employeesApi.downloadImportTemplate();
++                  downloadBlob(response.data as Blob, 'template-import-karyawan.xlsx');
++                } catch {
++                  // ignore — user can retry from import dialog
++                }
++              }}
++            >
++              <Download className="h-4 w-4 mr-2" />
++              Unduh template
++            </Button>
++            <Button variant="outline" onClick={() => setImportDialogOpen(true)}>
++              <Upload className="h-4 w-4 mr-2" />
++              Import
++            </Button>
+             <Button onClick={() => router.push('/employees/new')}>
+               <UserPlus className="h-4 w-4 mr-2" />
+               Add Employee
+             </Button>
+           </Can>
+         </div>
+       </div>
+ 
+@@ -1509,11 +1532,23 @@ export default function EmployeesPage() {
+             onClick={handleConfirmDelete} 
+             disabled={formLoading}
+             className="bg-red-600 hover:bg-red-700"
+           >
+             {formLoading ? 'Deleting...' : 'Delete Employee'}
+           </Button>
+         </ModalFooter>
+       </Modal>
++
++      <EmployeeImportDialog
++        open={importDialogOpen}
++        jobId={importJobId}
++        onClose={() => {
++          setImportDialogOpen(false);
++          setImportJobId('');
++        }}
++        onCompleted={() => {
++          void loadEmployees();
++        }}
++      />
+     </div>
+   );
+ }
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index be78a24..0f096f3 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -98,16 +98,39 @@ export const employeesApi = {
+   getById: (id: string) => api.get(`/employees/${id}`),
+   get360View: (id: string) => api.get(`/employees/${id}/360`),
+   getOrgChart: () => api.get('/employees/org-chart'),
+   getNextEmployeeCode: () => api.get<{ employeeCode: string }>('/employees/next-employee-code'),
+   create: (data: Record<string, unknown>) => api.post('/employees', data),
+   createSsoAccount: (id: string) => api.post(`/employees/${id}/sso-account`),
+   update: (id: string, data: Record<string, unknown>) => api.put(`/employees/${id}`, data),
+   delete: (id: string) => api.delete(`/employees/${id}`),
++  downloadImportTemplate: () =>
++    api.get('/employees/import/template', { responseType: 'blob' }),
++  enqueueImport: (file: File, nikPrefix: string) => {
++    const body = new FormData();
++    body.append('file', file);
++    body.append('nikPrefix', nikPrefix);
++    return api.post<{ jobId: string }>('/employees/import', body, {
++      headers: { 'Content-Type': 'multipart/form-data' },
++    });
++  },
++  getImportStatus: (jobId: string) =>
++    api.get<{
++      jobId: string;
++      state: 'waiting' | 'active' | 'completed' | 'failed';
++      progress: {
++        total: number;
++        processed: number;
++        created: number;
++        failed: number;
++        errors: { row: number; message: string }[];
++      };
++      failedReason?: string;
++    }>(`/employees/import/${jobId}`),
+ };
+ 
+ // Departments API
+ export const departmentsApi = {
+   getAll: () => api.get('/departments'),
+   getHierarchy: () => api.get('/departments/hierarchy'),
+   getById: (id: string) => api.get(`/departments/${id}`),
+   create: (data: Record<string, unknown>) => api.post('/departments', data),
+
+===== frontend/src/components/employees/EmployeeImportDialog.tsx =====
+'use client';
+
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import axios from 'axios';
+import { Download, Upload } from 'lucide-react';
+import { Button, FormError, Input, Modal, ModalFooter } from '@/components/ui';
+import { employeesApi } from '@/lib/api';
+import { downloadBlob } from '@/lib/download-blob';
+
+const NIK_PREFIX_REGEX = /^[1-9]\d$/;
+const PREFIX_ERROR = 'Prefix NIK harus 2 digit dari 10 sampai 99';
+
+type ImportJobState = 'waiting' | 'active' | 'completed' | 'failed';
+
+interface ImportProgress {
+  total: number;
+  processed: number;
+  created: number;
+  failed: number;
+  errors: { row: number; message: string }[];
+}
+
+interface ImportStatus {
+  jobId: string;
+  state: ImportJobState;
+  progress: ImportProgress;
+  failedReason?: string;
+}
+
+export interface EmployeeImportDialogProps {
+  open: boolean;
+  jobId: string;
+  onClose: () => void;
+  onCompleted: () => void;
+}
+
+export function EmployeeImportDialog({
+  open,
+  jobId: jobIdProp,
+  onClose,
+  onCompleted,
+}: EmployeeImportDialogProps) {
+  const [nikPrefix, setNikPrefix] = useState('');
+  const [prefixError, setPrefixError] = useState<string | null>(null);
+  const [activeJobId, setActiveJobId] = useState('');
+  const [status, setStatus] = useState<ImportStatus | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [downloadingTemplate, setDownloadingTemplate] = useState(false);
+  const completedNotifiedRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const effectiveJobId = activeJobId || jobIdProp;
+  const showProgress = Boolean(effectiveJobId);
+
+  useEffect(() => {
+    if (!open) {
+      setNikPrefix('');
+      setPrefixError(null);
+      setActiveJobId('');
+      setStatus(null);
+      setUploading(false);
+      setUploadError(null);
+      completedNotifiedRef.current = false;
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || !effectiveJobId) return;
+
+    let cancelled = false;
+    let intervalId: ReturnType<typeof setInterval> | undefined;
+
+    const poll = async () => {
+      try {
+        const response = await employeesApi.getImportStatus(effectiveJobId);
+        if (cancelled) return;
+        const data = response.data as ImportStatus;
+        setStatus(data);
+
+        if (data.state === 'completed' || data.state === 'failed') {
+          if (intervalId) clearInterval(intervalId);
+          if (data.state === 'completed' && !completedNotifiedRef.current) {
+            completedNotifiedRef.current = true;
+            onCompleted();
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          setUploadError('Gagal memuat status impor');
+        }
+      }
+    };
+
+    void poll();
+    intervalId = setInterval(() => {
+      void poll();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [open, effectiveJobId, onCompleted]);
+
+  const handleDownloadTemplate = async () => {
+    setDownloadingTemplate(true);
+    try {
+      const response = await employeesApi.downloadImportTemplate();
+      downloadBlob(response.data as Blob, 'template-import-karyawan.xlsx');
+    } catch {
+      setUploadError('Gagal mengunduh template');
+    } finally {
+      setDownloadingTemplate(false);
+    }
+  };
+
+  const validateAndUpload = useCallback(
+    async (file: File) => {
+      if (!NIK_PREFIX_REGEX.test(nikPrefix)) {
+        setPrefixError(PREFIX_ERROR);
+        return;
+      }
+      setPrefixError(null);
+      setUploadError(null);
+      setUploading(true);
+      try {
+        const response = await employeesApi.enqueueImport(file, nikPrefix);
+        setActiveJobId(response.data.jobId);
+      } catch (error) {
+        if (axios.isAxiosError(error) && error.response?.status === 409) {
+          const body = error.response.data as { jobId?: string };
+          if (body?.jobId) {
+            setActiveJobId(body.jobId);
+            return;
+          }
+        }
+        setUploadError('Gagal mengunggah file impor');
+      } finally {
+        setUploading(false);
+      }
+    },
+    [nikPrefix],
+  );
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.xlsx')) {
+      setUploadError('File harus berformat .xlsx');
+      return;
+    }
+    void validateAndUpload(file);
+  };
+
+  const progress = status?.progress;
+  const progressPercent =
+    progress && progress.total > 0
+      ? Math.min(100, Math.round((progress.processed / progress.total) * 100))
+      : 0;
+
+  return (
+    <Modal isOpen={open} onClose={onClose} title="Impor karyawan" size="lg">
+      {showProgress ? (
+        <div className="space-y-4">
+          <div>
+            <div className="flex justify-between text-sm text-warm-600 mb-1">
+              <span>Progress</span>
+              <span>
+                {progress?.processed ?? 0} / {progress?.total ?? 0}
+              </span>
+            </div>
+            <div className="h-2 bg-warm-100 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-primary-500 transition-all duration-300"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
+          </div>
+          <div className="flex gap-4 text-sm">
+            <span className="text-green-700 font-medium">{progress?.created ?? 0} berhasil</span>
+            <span className="text-red-600 font-medium">{progress?.failed ?? 0} gagal</span>
+          </div>
+          {status?.state === 'failed' && status.failedReason ? (
+            <p className="text-sm text-red-600">{status.failedReason}</p>
+          ) : null}
+          <ul className="space-y-1 max-h-48 overflow-y-auto">
+            {(progress?.errors ?? []).map((err) => (
+              <li key={`${err.row}-${err.message}`} className="text-sm text-warm-700">
+                Baris {err.row}: {err.message}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <p className="text-sm text-warm-600">
+            Unduh template, isi data karyawan, lalu unggah file Excel (.xlsx).
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void handleDownloadTemplate()}
+            disabled={downloadingTemplate}
+          >
+            <Download className="h-4 w-4 mr-2" />
+            Unduh template
+          </Button>
+          <div>
+            <label className="block text-sm font-medium text-warm-700 mb-1">Prefix NIK (10–99)</label>
+            <Input
+              value={nikPrefix}
+              onChange={(e) => {
+                setNikPrefix(e.target.value);
+                setPrefixError(null);
+              }}
+              placeholder="Contoh: 10"
+              maxLength={2}
+            />
+            {prefixError ? <FormError message={prefixError} /> : null}
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-warm-700 mb-1">File Excel</label>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              className="block w-full text-sm text-warm-600 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-warm-100 file:text-warm-800 hover:file:bg-warm-200"
+              onChange={handleFileChange}
+              disabled={uploading}
+            />
+          </div>
+          {uploadError ? <FormError message={uploadError} /> : null}
+        </div>
+      )}
+      <ModalFooter>
+        <Button type="button" variant="outline" onClick={onClose}>
+          Tutup
+        </Button>
+        {!showProgress ? (
+          <Button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+          >
+            <Upload className="h-4 w-4 mr-2" />
+            {uploading ? 'Mengunggah…' : 'Pilih file'}
+          </Button>
+        ) : null}
+      </ModalFooter>
+    </Modal>
+  );
+}
+
+===== frontend/src/components/employees/EmployeeImportDialog.test.tsx =====
+import { render, screen } from '@testing-library/react';
+import { EmployeeImportDialog } from './EmployeeImportDialog';
+
+jest.mock('@/lib/api', () => ({
+  employeesApi: {
+    getImportStatus: jest.fn().mockResolvedValue({
+      data: {
+        jobId: 'job-1',
+        state: 'active',
+        progress: { total: 10, processed: 4, created: 3, failed: 1, errors: [{ row: 5, message: 'Departemen tidak ditemukan' }] },
+      },
+    }),
+  },
+}));
+
+describe('EmployeeImportDialog', () => {
+  it('shows progress counts from the job status', async () => {
+    render(
+      <EmployeeImportDialog open jobId="job-1" onClose={jest.fn()} onCompleted={jest.fn()} />,
+    );
+
+    expect(await screen.findByText('3 berhasil')).toBeInTheDocument();
+    expect(screen.getByText('1 gagal')).toBeInTheDocument();
+    expect(screen.getByText('Baris 5: Departemen tidak ditemukan')).toBeInTheDocument();
+  });
+});
+

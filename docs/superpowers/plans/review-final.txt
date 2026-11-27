@@ -1,0 +1,1808 @@
+Commits: none. Working tree vs 275ab109e6b92540e0e44aff2efec2c5558280f3. Product files only.
+
+Stat:
+ backend/package.json                              |  9 +++++-
+ backend/prisma/schema.prisma                      |  2 +-
+ backend/src/common/queue/queue.module.ts          |  1 +
+ backend/src/modules/employees/employees.module.ts | 22 +++++++++++--
+ frontend/src/app/(protected)/employees/page.tsx   | 38 ++++++++++++++++++++++-
+ frontend/src/lib/api.ts                           | 23 ++++++++++++++
+ 6 files changed, 90 insertions(+), 5 deletions(-)
+
+Diff tracked:
+diff --git a/backend/package.json b/backend/package.json
+index e9a2c6b..1473f78 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -93,17 +93,24 @@
+     "moduleFileExtensions": [
+       "js",
+       "json",
+       "ts"
+     ],
+     "rootDir": "src",
+     "testRegex": ".*\\.spec\\.ts$",
+     "transform": {
+-      "^.+\\.(t|j)s$": "ts-jest"
++      "^.+\\.(t|j)s$": [
++        "ts-jest",
++        {
++          "tsconfig": {
++            "esModuleInterop": true
++          }
++        }
++      ]
+     },
+     "collectCoverageFrom": [
+       "**/*.(t|j)s"
+     ],
+     "coverageDirectory": "../coverage",
+     "testEnvironment": "node",
+     "moduleNameMapper": {
+       "^@/(.*)$": "<rootDir>/$1"
+diff --git a/backend/prisma/schema.prisma b/backend/prisma/schema.prisma
+index 9d8c806..64d0f54 100644
+--- a/backend/prisma/schema.prisma
++++ b/backend/prisma/schema.prisma
+@@ -256,17 +256,17 @@ enum EmployeeStatus {
+ }
+ 
+ model Employee {
+   id             String         @id @default(uuid())
+   tenantId       String
+   employeeCode   String
+   firstName      String
+   lastName       String
+-  email          String
++  email          String?
+   ssoUserId      String?        @unique
+   phone          String?
+   salutation     String?
+   gender         String?
+   dateOfBirth    DateTime?
+   fatherName     String?
+   aadhaarNumber  String?
+   ktpNumber      String?
+diff --git a/backend/src/common/queue/queue.module.ts b/backend/src/common/queue/queue.module.ts
+index 7c57f43..8d04fda 100644
+--- a/backend/src/common/queue/queue.module.ts
++++ b/backend/src/common/queue/queue.module.ts
+@@ -31,15 +31,16 @@ export class QueueModule {
+             },
+           }),
+           inject: [ConfigService],
+         }),
+         BullModule.registerQueue(
+           { name: 'email' },
+           { name: 'reports' },
+           { name: 'payroll' },
++          { name: 'employee-import' },
+         ),
+       ],
+       providers: [EmailProcessor],
+       exports: [BullModule],
+     };
+   }
+ }
+diff --git a/backend/src/modules/employees/employees.module.ts b/backend/src/modules/employees/employees.module.ts
+index 3deac7a..88fba83 100644
+--- a/backend/src/modules/employees/employees.module.ts
++++ b/backend/src/modules/employees/employees.module.ts
+@@ -1,24 +1,42 @@
+ import { Module } from '@nestjs/common';
++import { BullModule } from '@nestjs/bullmq';
+ import { AttendanceModule } from '../attendance/attendance.module';
+ import { EmployeesController } from './employees.controller';
+ import { EmployeesService } from './employees.service';
+ import { CardEnrollmentService } from './card-enrollment.service';
+ import {
+   CardEnrollmentCommandController,
+   CardEnrollmentQueryController,
+ } from './card-enrollment.controller';
+ import { AttendanceDeskController } from '../attendance/device/attendance-desk.controller';
+ import { AttendanceDeskService } from '../attendance/device/attendance-desk.service';
++import { EmployeeImportController } from './import/employee-import.controller';
++import { EmployeeImportService } from './import/employee-import.service';
++import { EmployeeImportProcessor } from './import/employee-import.processor';
++
++const redisEnabled = process.env.REDIS_ENABLED === 'true';
+ 
+ @Module({
+-  imports: [AttendanceModule],
++  imports: [
++    AttendanceModule,
++    ...(redisEnabled
++      ? [BullModule.registerQueue({ name: 'employee-import' })]
++      : []),
++  ],
+   controllers: [
+     EmployeesController,
++    ...(redisEnabled ? [EmployeeImportController] : []),
+     CardEnrollmentQueryController,
+     CardEnrollmentCommandController,
+     AttendanceDeskController,
+   ],
+-  providers: [EmployeesService, CardEnrollmentService, AttendanceDeskService],
++  providers: [
++    EmployeesService,
++    CardEnrollmentService,
++    AttendanceDeskService,
++    EmployeeImportService,
++    ...(redisEnabled ? [EmployeeImportProcessor] : []),
++  ],
+   exports: [EmployeesService, CardEnrollmentService],
+ })
+ export class EmployeesModule {}
+diff --git a/frontend/src/app/(protected)/employees/page.tsx b/frontend/src/app/(protected)/employees/page.tsx
+index cf0a61d..68a8994 100644
+--- a/frontend/src/app/(protected)/employees/page.tsx
++++ b/frontend/src/app/(protected)/employees/page.tsx
+@@ -3,25 +3,27 @@
+ import React, { useEffect, useState, useCallback } from 'react';
+ import { useRouter } from 'next/navigation';
+ import { 
+   Card, CardHeader, CardTitle, CardContent,
+   Table, TableHeader, TableBody, TableRow, TableHead, TableCell, TableEmptyState, TableLoadingState,
+   Badge, getStatusBadgeVariant, Select, Input, Button,
+   Modal, ModalFooter, FormRow, FormGrid, FormError, FormSuccess
+ } from '@/components/ui';
+-import { Search, Plus, Eye, Edit2, Trash2, UserPlus, Phone, Mail, Calendar, Building2, Users, Download, Filter, X, ChevronDown, ChevronUp, ShieldCheck } from 'lucide-react';
++import { Search, Plus, Eye, Edit2, Trash2, UserPlus, Phone, Mail, Calendar, Building2, Users, Download, Filter, X, ChevronDown, ChevronUp, ShieldCheck, Upload } from 'lucide-react';
+ import { employeesApi, departmentsApi, designationsApi } from '@/lib/api';
+ import { Employee, Department, Designation, EmploymentType, EmployeeStatus, PayType } from '@/types';
+ import { EMPLOYEE_TYPE_OPTIONS } from '@/lib/employee-type-options';
+ import { parseAmountToNumber } from '@/lib/input-mask';
+ import { useAuth } from '@/contexts/AuthContext';
+ import { Can } from '@/components/Can';
+ import { OrganizationFields } from '@/components/employees/OrganizationFields';
++import { EmployeeImportDialog } from '@/components/employees/EmployeeImportDialog';
+ import { resolveOrgSelection, toPersistedDepartmentId } from '@/components/employees/org-fields';
++import { downloadBlob } from '@/lib/download-blob';
+ import {
+   employeeCodeHint,
+   isValidEmployeeCode,
+   KTP_NUMBER_REGEX,
+   normalizeKtpInput,
+ } from '@/lib/employee-code';
+ 
+ // Types for form data
+@@ -100,16 +102,19 @@ export default function EmployeesPage() {
+   const [ssoActionError, setSsoActionError] = useState('');
+   const [ssoCreatingId, setSsoCreatingId] = useState<string | null>(null);
+   const [formSuccess, setFormSuccess] = useState('');
+   const [formLoading, setFormLoading] = useState(false);
+ 
+   // Expanded row for quick view
+   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+ 
++  const [importDialogOpen, setImportDialogOpen] = useState(false);
++  const [importJobId, setImportJobId] = useState('');
++
+   useEffect(() => {
+     loadDepartments();
+     loadDesignations();
+     loadAllEmployees();
+   }, []);
+ 
+   useEffect(() => {
+     loadEmployees();
+@@ -495,16 +500,34 @@ export default function EmployeesPage() {
+       {/* Header */}
+       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4">
+         <div>
+           <h1 className="text-xl sm:text-2xl font-bold text-warm-900">Employees</h1>
+           <p className="text-warm-500">Manage and view employee information</p>
+         </div>
+         <div className="flex gap-2">
+           <Can permission="employees:create">
++            <Button
++              variant="outline"
++              onClick={async () => {
++                try {
++                  const response = await employeesApi.downloadImportTemplate();
++                  downloadBlob(response.data as Blob, 'template-import-karyawan.xlsx');
++                } catch {
++                  // ignore — user can retry from import dialog
++                }
++              }}
++            >
++              <Download className="h-4 w-4 mr-2" />
++              Unduh template
++            </Button>
++            <Button variant="outline" onClick={() => setImportDialogOpen(true)}>
++              <Upload className="h-4 w-4 mr-2" />
++              Import
++            </Button>
+             <Button onClick={() => router.push('/employees/new')}>
+               <UserPlus className="h-4 w-4 mr-2" />
+               Add Employee
+             </Button>
+           </Can>
+         </div>
+       </div>
+ 
+@@ -1509,11 +1532,24 @@ export default function EmployeesPage() {
+             onClick={handleConfirmDelete} 
+             disabled={formLoading}
+             className="bg-red-600 hover:bg-red-700"
+           >
+             {formLoading ? 'Deleting...' : 'Delete Employee'}
+           </Button>
+         </ModalFooter>
+       </Modal>
++
++      <EmployeeImportDialog
++        open={importDialogOpen}
++        jobId={importJobId}
++        onClose={() => {
++          setImportDialogOpen(false);
++          setImportJobId('');
++        }}
++        onCompleted={() => {
++          void loadEmployees();
++          void loadAllEmployees();
++        }}
++      />
+     </div>
+   );
+ }
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index be78a24..0f096f3 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -98,16 +98,39 @@ export const employeesApi = {
+   getById: (id: string) => api.get(`/employees/${id}`),
+   get360View: (id: string) => api.get(`/employees/${id}/360`),
+   getOrgChart: () => api.get('/employees/org-chart'),
+   getNextEmployeeCode: () => api.get<{ employeeCode: string }>('/employees/next-employee-code'),
+   create: (data: Record<string, unknown>) => api.post('/employees', data),
+   createSsoAccount: (id: string) => api.post(`/employees/${id}/sso-account`),
+   update: (id: string, data: Record<string, unknown>) => api.put(`/employees/${id}`, data),
+   delete: (id: string) => api.delete(`/employees/${id}`),
++  downloadImportTemplate: () =>
++    api.get('/employees/import/template', { responseType: 'blob' }),
++  enqueueImport: (file: File, nikPrefix: string) => {
++    const body = new FormData();
++    body.append('file', file);
++    body.append('nikPrefix', nikPrefix);
++    return api.post<{ jobId: string }>('/employees/import', body, {
++      headers: { 'Content-Type': 'multipart/form-data' },
++    });
++  },
++  getImportStatus: (jobId: string) =>
++    api.get<{
++      jobId: string;
++      state: 'waiting' | 'active' | 'completed' | 'failed';
++      progress: {
++        total: number;
++        processed: number;
++        created: number;
++        failed: number;
++        errors: { row: number; message: string }[];
++      };
++      failedReason?: string;
++    }>(`/employees/import/${jobId}`),
+ };
+ 
+ // Departments API
+ export const departmentsApi = {
+   getAll: () => api.get('/departments'),
+   getHierarchy: () => api.get('/departments/hierarchy'),
+   getById: (id: string) => api.get(`/departments/${id}`),
+   create: (data: Record<string, unknown>) => api.post('/departments', data),
+
+===== untracked backend/prisma/migrations/20261103210000_employee_email_optional/migration.sql =====
+ALTER TABLE "employees" ALTER COLUMN "email" DROP NOT NULL;
+
+===== untracked backend/src/modules/employees/import/employee-email-optional.spec.ts =====
+import { Prisma } from '@prisma/client';
+
+describe('Employee.email', () => {
+  it('is optional on the Prisma model', () => {
+    const field = Prisma.dmmf.datamodel.models
+      .find((model) => model.name === 'Employee')
+      ?.fields.find((item) => item.name === 'email');
+
+    expect(field?.isRequired).toBe(false);
+  });
+});
+
+===== untracked backend/src/modules/employees/import/employee-import-parser.spec.ts =====
+import { assertImportHeaders, parseEmployeeSheet } from './employee-import-parser';
+
+const departments = [{ id: 'dept-1', name: 'Engineering', code: 'ENG' }];
+
+describe('parseEmployeeSheet', () => {
+  const header = [
+    'Nama depan',
+    'Nama belakang',
+    'Departemen',
+    'Tipe kerja',
+    'Email',
+    'Telepon',
+    'Tanggal bergabung',
+  ];
+
+  it('rejects a header that does not match the template', () => {
+    expect(() => assertImportHeaders(['Nama'])).toThrow('Header sheet Data tidak sesuai template');
+  });
+
+  it('parses a valid row and skips a blank row', () => {
+    const result = parseEmployeeSheet(
+      [
+        header,
+        ['Amir', 'Mufid', 'ENG', 'PERMANENT', '', '0812', ''],
+        ['', '', '', '', '', '', ''],
+        ['Budi', 'Santoso', 'Tidak Ada', 'MAGIC', 'budi@eiger.test', '', '2026-01-15'],
+      ],
+      departments,
+    );
+
+    expect(result.rows).toEqual([
+      expect.objectContaining({
+        row: 2,
+        firstName: 'Amir',
+        lastName: 'Mufid',
+        departmentId: 'dept-1',
+        employmentType: 'PERMANENT',
+        email: null,
+        phone: '0812',
+        joinDate: null,
+      }),
+    ]);
+    expect(result.errors.map((error) => error.row)).toEqual([4]);
+    expect(result.errors[0].message).toContain('Departemen tidak ditemukan');
+    expect(result.errors[0].message).toContain('Tipe kerja tidak valid');
+  });
+
+  it('reads an Excel date and a numeric phone that lost its leading zero', () => {
+    const result = parseEmployeeSheet(
+      [
+        header,
+        [
+          'Amir',
+          'Mufid',
+          'ENG',
+          'PERMANENT',
+          '',
+          8123456789,
+          new Date(Date.UTC(2026, 0, 15)),
+        ],
+      ],
+      departments,
+    );
+
+    expect(result.errors).toEqual([]);
+    expect(result.rows[0]).toEqual(
+      expect.objectContaining({
+        phone: '08123456789',
+        joinDate: '2026-01-15',
+      }),
+    );
+  });
+
+  it('rejects a duplicate email inside the same file on the second row', () => {
+    const result = parseEmployeeSheet(
+      [
+        header,
+        ['Amir', 'Mufid', 'engineering', 'CONTRACT', 'amir@eiger.test', '', '2026-02-01'],
+        ['Sari', 'Putri', 'Engineering', 'INTERN', 'amir@eiger.test', '', ''],
+      ],
+      departments,
+    );
+
+    expect(result.rows).toHaveLength(1);
+    expect(result.errors[0]).toEqual({
+      row: 3,
+      message: 'Email sudah dipakai',
+    });
+  });
+});
+
+===== untracked backend/src/modules/employees/import/employee-import-parser.ts =====
+import {
+  EMPLOYMENT_TYPES,
+  IMPORT_HEADERS,
+  type EmploymentTypeValue,
+  type ImportRowError,
+  type ParsedEmployeeRow,
+} from './employee-import.types';
+
+const HEADER_ERROR = 'Header sheet Data tidak sesuai template';
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export { IMPORT_HEADERS, type ParsedEmployeeRow } from './employee-import.types';
+
+export function assertImportHeaders(header: unknown[]): void {
+  for (let i = 0; i < IMPORT_HEADERS.length; i++) {
+    const cell = header[i];
+    const value = cell == null ? '' : String(cell).trim();
+    if (value !== IMPORT_HEADERS[i]) {
+      throw new Error(HEADER_ERROR);
+    }
+  }
+}
+
+function cellString(value: unknown): string {
+  if (value == null) {
+    return '';
+  }
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      return '';
+    }
+    const year = value.getUTCFullYear();
+    const month = String(value.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(value.getUTCDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const digits = Number.isSafeInteger(value)
+      ? value.toLocaleString('fullwide', { useGrouping: false })
+      : String(value);
+    if (/^8\d{8,12}$/.test(digits)) {
+      return `0${digits}`;
+    }
+    return digits;
+  }
+  if (typeof value === 'object') {
+    const record = value as {
+      text?: unknown;
+      result?: unknown;
+      richText?: { text?: string }[];
+    };
+    if (typeof record.text === 'string') {
+      return record.text.trim();
+    }
+    if (Array.isArray(record.richText)) {
+      return record.richText
+        .map((part) => part.text ?? '')
+        .join('')
+        .trim();
+    }
+    if ('result' in record) {
+      return cellString(record.result);
+    }
+  }
+  return String(value).trim();
+}
+
+function isBlankRow(cells: string[]): boolean {
+  return cells.every((c) => c === '');
+}
+
+function findDepartmentId(
+  raw: string,
+  departments: { id: string; name: string; code: string }[],
+): string | null {
+  if (raw === '') {
+    return null;
+  }
+  const byCode = departments.find((d) => d.code === raw);
+  if (byCode) {
+    return byCode.id;
+  }
+  const lower = raw.toLowerCase();
+  const byName = departments.find((d) => d.name.trim().toLowerCase() === lower);
+  return byName?.id ?? null;
+}
+
+function parseEmploymentType(raw: string): EmploymentTypeValue | null {
+  if (raw === '') {
+    return null;
+  }
+  if ((EMPLOYMENT_TYPES as readonly string[]).includes(raw)) {
+    return raw as EmploymentTypeValue;
+  }
+  return null;
+}
+
+function parseJoinDate(raw: string): string | null | 'invalid' {
+  if (raw === '') {
+    return null;
+  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (!match) {
+    return 'invalid';
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const utc = Date.UTC(year, month - 1, day);
+  const d = new Date(utc);
+  if (
+    d.getUTCFullYear() !== year ||
+    d.getUTCMonth() !== month - 1 ||
+    d.getUTCDate() !== day
+  ) {
+    return 'invalid';
+  }
+  return raw;
+}
+
+export function jakartaJoinDate(now: Date = new Date()): Date {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jakarta',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const parts = formatter.formatToParts(now);
+  const year = parts.find((p) => p.type === 'year')?.value ?? '1970';
+  const month = parts.find((p) => p.type === 'month')?.value ?? '01';
+  const day = parts.find((p) => p.type === 'day')?.value ?? '01';
+  return new Date(`${year}-${month}-${day}T00:00:00.000Z`);
+}
+
+export function parseEmployeeSheet(
+  rows: unknown[][],
+  departments: { id: string; name: string; code: string }[],
+): { rows: ParsedEmployeeRow[]; errors: ImportRowError[] } {
+  if (rows.length === 0) {
+    throw new Error(HEADER_ERROR);
+  }
+
+  assertImportHeaders(rows[0]);
+
+  const parsedRows: ParsedEmployeeRow[] = [];
+  const errors: ImportRowError[] = [];
+  const seenEmails = new Set<string>();
+
+  for (let i = 1; i < rows.length; i++) {
+    const sheetRow = i + 1;
+    const rawRow = rows[i] ?? [];
+    const cells = IMPORT_HEADERS.map((_, col) => cellString(rawRow[col]));
+
+    if (isBlankRow(cells)) {
+      continue;
+    }
+
+    const messages: string[] = [];
+
+    const firstName = cells[0];
+    const lastName = cells[1];
+    const departmentRaw = cells[2];
+    const employmentRaw = cells[3];
+    const emailRaw = cells[4];
+    const phoneRaw = cells[5];
+    const joinDateRaw = cells[6];
+
+    if (firstName === '') {
+      messages.push('Nama depan wajib diisi');
+    }
+    if (lastName === '') {
+      messages.push('Nama belakang wajib diisi');
+    }
+
+    const departmentId = findDepartmentId(departmentRaw, departments);
+    if (departmentId == null) {
+      messages.push('Departemen tidak ditemukan');
+    }
+
+    const employmentType = parseEmploymentType(employmentRaw);
+    if (employmentType == null) {
+      messages.push('Tipe kerja tidak valid');
+    }
+
+    let email: string | null = null;
+    if (emailRaw === '') {
+      email = null;
+    } else if (!EMAIL_REGEX.test(emailRaw)) {
+      messages.push('Email tidak valid');
+    } else {
+      const normalized = emailRaw.toLowerCase();
+      if (seenEmails.has(normalized)) {
+        messages.push('Email sudah dipakai');
+      } else {
+        email = emailRaw;
+      }
+    }
+
+    const phone = phoneRaw === '' ? null : phoneRaw;
+
+    const joinDateResult = parseJoinDate(joinDateRaw);
+    let joinDate: string | null = null;
+    if (joinDateResult === 'invalid') {
+      messages.push('Tanggal bergabung tidak valid');
+    } else {
+      joinDate = joinDateResult;
+    }
+
+    if (messages.length > 0) {
+      errors.push({ row: sheetRow, message: messages.join('; ') });
+      continue;
+    }
+
+    parsedRows.push({
+      row: sheetRow,
+      firstName,
+      lastName,
+      departmentId: departmentId!,
+      employmentType: employmentType!,
+      email,
+      phone,
+      joinDate,
+    });
+    if (email != null) {
+      seenEmails.add(email.toLowerCase());
+    }
+  }
+
+  return { rows: parsedRows, errors };
+}
+
+===== untracked backend/src/modules/employees/import/employee-import-template.spec.ts =====
+import ExcelJS from 'exceljs';
+import { buildEmployeeImportTemplate } from './employee-import-template';
+import { IMPORT_HEADERS } from './employee-import.types';
+
+describe('buildEmployeeImportTemplate', () => {
+  it('writes headers on Data and one sample on Contoh', async () => {
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(
+      (await buildEmployeeImportTemplate()) as unknown as Awaited<
+        ReturnType<InstanceType<typeof ExcelJS.Workbook>['xlsx']['writeBuffer']>
+      >,
+    );
+
+    const data = workbook.getWorksheet('Data');
+    const sample = workbook.getWorksheet('Contoh');
+    const headers = IMPORT_HEADERS.map((_, index) => data?.getRow(1).getCell(index + 1).value);
+
+    expect(headers).toEqual([...IMPORT_HEADERS]);
+    expect(data?.rowCount).toBe(1);
+    expect(sample?.getRow(2).getCell(1).value).toBe('Amir');
+    expect(sample?.getRow(2).getCell(4).value).toBe('PERMANENT');
+  });
+});
+
+===== untracked backend/src/modules/employees/import/employee-import-template.ts =====
+import * as ExcelJS from 'exceljs';
+import { IMPORT_HEADERS } from './employee-import.types';
+
+export async function buildEmployeeImportTemplate(): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+
+  const dataSheet = workbook.addWorksheet('Data');
+  dataSheet.addRow([...IMPORT_HEADERS]);
+
+  const sampleSheet = workbook.addWorksheet('Contoh');
+  sampleSheet.addRow([...IMPORT_HEADERS]);
+  sampleSheet.addRow([
+    'Amir',
+    'Mufid',
+    'Engineering',
+    'PERMANENT',
+    'amir@eiger.test',
+    '08123456789',
+    '2026-01-15',
+  ]);
+
+  const xlsxBuffer = await workbook.xlsx.writeBuffer();
+  return Buffer.from(xlsxBuffer) as Buffer;
+}
+
+===== untracked backend/src/modules/employees/import/employee-import.controller.spec.ts =====
+import { ConflictException } from '@nestjs/common';
+import { getQueueToken } from '@nestjs/bullmq';
+import { Test } from '@nestjs/testing';
+import { EmployeeImportController } from './employee-import.controller';
+import { overrideJwtAuthGuard } from '../../../test/helpers';
+
+describe('EmployeeImportController', () => {
+  const queue = {
+    add: jest.fn().mockResolvedValue({ id: 'job-1' }),
+    getJobs: jest.fn().mockResolvedValue([]),
+    getJob: jest.fn(),
+  };
+
+  it('returns the job id without importing rows', async () => {
+    const module = await overrideJwtAuthGuard(
+      Test.createTestingModule({
+        controllers: [EmployeeImportController],
+        providers: [{ provide: getQueueToken('employee-import'), useValue: queue }],
+      }),
+    ).compile();
+    const controller = module.get(EmployeeImportController);
+
+    await expect(
+      controller.enqueue(
+        { tenantId: 'tenant-1' } as never,
+        { nikPrefix: '90' },
+        {
+          buffer: Buffer.from('xlsx'),
+          originalname: 'karyawan.xlsx',
+          size: 4,
+          mimetype: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        } as never,
+      ),
+    ).resolves.toEqual({ jobId: 'job-1' });
+    expect(queue.add).toHaveBeenCalledWith(
+      'import',
+      expect.objectContaining({ tenantId: 'tenant-1', nikPrefix: '90' }),
+    );
+  });
+
+  it('rejects a second active import for the same tenant', async () => {
+    queue.getJobs.mockResolvedValueOnce([
+      { id: 'job-9', data: { tenantId: 'tenant-1' }, getState: async () => 'active' },
+    ]);
+    const module = await overrideJwtAuthGuard(
+      Test.createTestingModule({
+        controllers: [EmployeeImportController],
+        providers: [{ provide: getQueueToken('employee-import'), useValue: queue }],
+      }),
+    ).compile();
+    const controller = module.get(EmployeeImportController);
+
+    await expect(
+      controller.enqueue({ tenantId: 'tenant-1' } as never, { nikPrefix: '90' }, {
+        buffer: Buffer.from('xlsx'),
+        originalname: 'karyawan.xlsx',
+        size: 4,
+      } as never),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('returns the failure reason for a failed job', async () => {
+    queue.getJob.mockResolvedValueOnce({
+      id: 'job-1',
+      data: { tenantId: 'tenant-1' },
+      failedReason: 'Header sheet Data tidak sesuai template',
+      progress: 0,
+      getState: async () => 'failed',
+    });
+    const module = await overrideJwtAuthGuard(
+      Test.createTestingModule({
+        controllers: [EmployeeImportController],
+        providers: [{ provide: getQueueToken('employee-import'), useValue: queue }],
+      }),
+    ).compile();
+    const controller = module.get(EmployeeImportController);
+
+    await expect(
+      controller.getJobStatus({ tenantId: 'tenant-1' } as never, 'job-1'),
+    ).resolves.toEqual({
+      jobId: 'job-1',
+      state: 'failed',
+      progress: { total: 0, processed: 0, created: 0, failed: 0, errors: [] },
+      failedReason: 'Header sheet Data tidak sesuai template',
+    });
+  });
+});
+
+===== untracked backend/src/modules/employees/import/employee-import.controller.ts =====
+import {
+  BadRequestException,
+  ConflictException,
+  Controller,
+  Get,
+  NotFoundException,
+  Param,
+  Post,
+  Body,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+  Res,
+} from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Queue } from 'bullmq';
+import * as ExcelJS from 'exceljs';
+import { mkdir, unlink, writeFile } from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+import { randomUUID } from 'crypto';
+import { Response } from 'express';
+import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
+import { PermissionsGuard } from '../../../common/guards/permissions.guard';
+import { RequirePermissions } from '../../../common/decorators/permissions.decorator';
+import { CurrentUser } from '../../../common/decorators/current-user.decorator';
+import { AuthenticatedUser } from '../../../common/types/jwt-payload.type';
+import { assertNikPrefix } from './nik-sequence';
+import { buildEmployeeImportTemplate } from './employee-import-template';
+import {
+  EmployeeImportJobData,
+  IMPORT_HEADERS,
+  normalizeImportProgress,
+} from './employee-import.types';
+
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_DATA_ROWS = 5000;
+
+function isBlankDataRow(cells: string[]): boolean {
+  return cells.every((c) => c === '');
+}
+
+async function countNonEmptyDataRows(buffer: Buffer): Promise<number> {
+  const workbook = new ExcelJS.Workbook();
+  try {
+    await workbook.xlsx.load(
+      buffer as unknown as Awaited<
+        ReturnType<InstanceType<typeof ExcelJS.Workbook>['xlsx']['writeBuffer']>
+      >,
+    );
+  } catch {
+    return 0;
+  }
+  const sheet = workbook.getWorksheet('Data');
+  if (!sheet) {
+    return 0;
+  }
+  let count = 0;
+  sheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) {
+      return;
+    }
+    const values = row.values;
+    const rawRow = Array.isArray(values) ? values.slice(1) : [];
+    const cells = IMPORT_HEADERS.map((_, col) => {
+      const cell = rawRow[col];
+      return cell == null ? '' : String(cell).trim();
+    });
+    if (!isBlankDataRow(cells)) {
+      count++;
+    }
+  });
+  return count;
+}
+
+@ApiTags('employees')
+@ApiBearerAuth()
+@Controller('employees/import')
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+export class EmployeeImportController {
+  constructor(
+    @InjectQueue('employee-import') private readonly queue: Queue<EmployeeImportJobData>,
+  ) {}
+
+  @Get('template')
+  @ApiOperation({ summary: 'Download employee import spreadsheet template' })
+  @RequirePermissions('employees:create')
+  async downloadTemplate(@Res() res: Response): Promise<void> {
+    const buffer = await buildEmployeeImportTemplate();
+    res.set({
+      'Content-Type':
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': 'attachment; filename="template-import-karyawan.xlsx"',
+      'Content-Length': buffer.length,
+    });
+    res.end(buffer);
+  }
+
+  @Post()
+  @ApiOperation({ summary: 'Enqueue employee spreadsheet import' })
+  @RequirePermissions('employees:create')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      limits: { fileSize: MAX_FILE_BYTES },
+    }),
+  )
+  async enqueue(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() body: { nikPrefix: string },
+    @UploadedFile() file: Express.Multer.File,
+  ): Promise<{ jobId: string }> {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('File impor wajib diunggah');
+    }
+
+    const originalName = file.originalname ?? '';
+    if (!/\.xlsx$/i.test(originalName)) {
+      throw new BadRequestException('File harus berformat .xlsx');
+    }
+
+    let nikPrefix: string;
+    try {
+      nikPrefix = assertNikPrefix(body.nikPrefix ?? '');
+    } catch (err) {
+      throw new BadRequestException(
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+
+    const waitingOrActive = await this.queue.getJobs(['waiting', 'active']);
+    for (const job of waitingOrActive) {
+      if (job.data?.tenantId !== user.tenantId) {
+        continue;
+      }
+      const state = await job.getState();
+      const progress = normalizeImportProgress(job.progress);
+      throw new ConflictException({ jobId: String(job.id), state, progress });
+    }
+
+    const dir = path.join(os.tmpdir(), 'hrms-employee-import');
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, `${randomUUID()}.xlsx`);
+    await writeFile(filePath, file.buffer);
+
+    const rowCount = await countNonEmptyDataRows(file.buffer);
+    if (rowCount > MAX_DATA_ROWS) {
+      await unlink(filePath).catch(() => undefined);
+      throw new BadRequestException(
+        `Maksimal ${MAX_DATA_ROWS} baris data per file impor`,
+      );
+    }
+
+    const job = await this.queue.add('import', {
+      tenantId: user.tenantId,
+      filePath,
+      nikPrefix,
+    });
+
+    return { jobId: String(job.id) };
+  }
+
+  @Get(':jobId')
+  @ApiOperation({ summary: 'Get employee import job status' })
+  @RequirePermissions('employees:create')
+  async getJobStatus(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('jobId') jobId: string,
+  ): Promise<{
+    jobId: string;
+    state: string;
+    progress: ReturnType<typeof normalizeImportProgress>;
+    failedReason?: string;
+  }> {
+    const job = await this.queue.getJob(jobId);
+    if (!job || job.data?.tenantId !== user.tenantId) {
+      throw new NotFoundException('Job impor tidak ditemukan');
+    }
+
+    const state = await job.getState();
+    if (!['waiting', 'active', 'completed', 'failed'].includes(state)) {
+      throw new NotFoundException('Job impor tidak ditemukan');
+    }
+
+    return {
+      jobId: String(job.id),
+      state,
+      progress: normalizeImportProgress(job.progress),
+      failedReason:
+        state === 'failed' ? job.failedReason || 'Impor gagal' : undefined,
+    };
+  }
+}
+
+===== untracked backend/src/modules/employees/import/employee-import.processor.spec.ts =====
+import { EmployeeImportProcessor } from './employee-import.processor';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+import * as ExcelJS from 'exceljs';
+import { EmployeeImportService } from './employee-import.service';
+import { PrismaService } from '../../../prisma/prisma.service';
+
+describe('EmployeeImportProcessor', () => {
+  const importRows = jest.fn();
+  const prisma = {
+    department: { findMany: jest.fn().mockResolvedValue([]) },
+    employee: { findMany: jest.fn().mockResolvedValue([]) },
+  };
+
+  let processor: EmployeeImportProcessor;
+
+  beforeEach(() => {
+    importRows.mockReset();
+    processor = new EmployeeImportProcessor(
+      prisma as unknown as PrismaService,
+      { importRows } as unknown as EmployeeImportService,
+    );
+  });
+
+  it('deletes the file and throws on invalid headers before importRows', async () => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Data');
+    sheet.addRow(['Salah', 'Header']);
+
+    const filePath = path.join(os.tmpdir(), `hrms-import-test-${Date.now()}.xlsx`);
+    await workbook.xlsx.writeFile(filePath);
+
+    const job = {
+      id: 'job-1',
+      data: { tenantId: 'tenant-1', filePath, nikPrefix: '90' },
+      updateProgress: jest.fn(),
+    };
+
+    await expect(processor.process(job as never)).rejects.toThrow(
+      'Header sheet Data tidak sesuai template',
+    );
+    await expect(fs.access(filePath)).rejects.toThrow();
+    expect(importRows).not.toHaveBeenCalled();
+  });
+
+  it('keeps the spreadsheet row number when a blank row is skipped by Excel', async () => {
+    prisma.department.findMany.mockResolvedValue([
+      { id: 'dept-1', name: 'Engineering', code: 'ENG' },
+    ]);
+    importRows.mockResolvedValue({ created: 2, failed: 0, errors: [] });
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Data');
+    sheet.addRow([
+      'Nama depan',
+      'Nama belakang',
+      'Departemen',
+      'Tipe kerja',
+      'Email',
+      'Telepon',
+      'Tanggal bergabung',
+    ]);
+    sheet.addRow(['Amir', 'Mufid', 'ENG', 'PERMANENT', '', '0812', '']);
+    const budi = sheet.getRow(4);
+    budi.getCell(1).value = 'Budi';
+    budi.getCell(2).value = 'Santoso';
+    budi.getCell(3).value = 'ENG';
+    budi.getCell(4).value = 'CONTRACT';
+
+    const filePath = path.join(os.tmpdir(), `hrms-import-blank-${Date.now()}.xlsx`);
+    await workbook.xlsx.writeFile(filePath);
+
+    const job = {
+      id: 'job-2',
+      data: { tenantId: 'tenant-1', filePath, nikPrefix: '90' },
+      updateProgress: jest.fn(),
+    };
+
+    await processor.process(job as never);
+
+    expect(importRows).toHaveBeenCalledWith(
+      'tenant-1',
+      '90',
+      [
+        expect.objectContaining({ row: 2, firstName: 'Amir' }),
+        expect.objectContaining({ row: 4, firstName: 'Budi' }),
+      ],
+      expect.any(Set),
+    );
+  });
+});
+
+===== untracked backend/src/modules/employees/import/employee-import.processor.ts =====
+import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { Logger } from '@nestjs/common';
+import { Job } from 'bullmq';
+import * as ExcelJS from 'exceljs';
+import { unlink } from 'fs/promises';
+import { PrismaService } from '../../../prisma/prisma.service';
+import { assertImportHeaders, parseEmployeeSheet } from './employee-import-parser';
+import { EmployeeImportService } from './employee-import.service';
+import type {
+  EmployeeImportJobData,
+  EmployeeImportProgress,
+} from './employee-import.types';
+
+function worksheetToRows(sheet: ExcelJS.Worksheet): unknown[][] {
+  const rows: unknown[][] = [];
+  sheet.eachRow((row, rowNumber) => {
+    const values = row.values;
+    const cells = Array.isArray(values) ? values.slice(1) : [];
+    while (rows.length < rowNumber - 1) {
+      rows.push([]);
+    }
+    rows[rowNumber - 1] = cells;
+  });
+  return rows;
+}
+
+@Processor('employee-import')
+export class EmployeeImportProcessor extends WorkerHost {
+  private readonly logger = new Logger(EmployeeImportProcessor.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly employeeImportService: EmployeeImportService,
+  ) {
+    super();
+  }
+
+  async process(job: Job<EmployeeImportJobData>): Promise<void> {
+    const { tenantId, filePath, nikPrefix } = job.data;
+    this.logger.debug(`Processing employee import job ${job.id} for tenant ${tenantId}`);
+
+    try {
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.readFile(filePath);
+
+      const sheet = workbook.getWorksheet('Data');
+      if (!sheet) {
+        throw new Error('Sheet Data tidak ditemukan');
+      }
+
+      const rows = worksheetToRows(sheet);
+      const headerRow = rows[0] ?? [];
+      assertImportHeaders(headerRow);
+
+      const departments = await this.prisma.department.findMany({
+        where: { tenantId },
+        select: { id: true, name: true, code: true },
+      });
+
+      const parsed = parseEmployeeSheet(rows, departments);
+      const total = parsed.rows.length + parsed.errors.length;
+
+      const afterParse: EmployeeImportProgress = {
+        total,
+        processed: total,
+        created: 0,
+        failed: parsed.errors.length,
+        errors: [...parsed.errors],
+      };
+      await job.updateProgress(afterParse);
+
+      const emails = parsed.rows
+        .map((row) => row.email)
+        .filter((email): email is string => email != null && email !== '');
+
+      const existingRecords =
+        emails.length === 0
+          ? []
+          : await this.prisma.employee.findMany({
+              where: { tenantId, email: { in: emails } },
+              select: { email: true },
+            });
+
+      const existingEmails = new Set(
+        existingRecords
+          .map((record) => record.email?.toLowerCase())
+          .filter((email): email is string => email != null),
+      );
+
+      const importResult = await this.employeeImportService.importRows(
+        tenantId,
+        nikPrefix,
+        parsed.rows,
+        existingEmails,
+      );
+
+      const combinedErrors = [...parsed.errors, ...importResult.errors];
+      const afterImport: EmployeeImportProgress = {
+        total,
+        processed: total,
+        created: importResult.created,
+        failed: parsed.errors.length + importResult.failed,
+        errors: combinedErrors,
+      };
+      await job.updateProgress(afterImport);
+    } catch (error) {
+      this.logger.error(
+        `Employee import job ${job.id} failed: ${error instanceof Error ? error.message : error}`,
+      );
+      throw error;
+    } finally {
+      await unlink(filePath).catch(() => undefined);
+    }
+  }
+}
+
+===== untracked backend/src/modules/employees/import/employee-import.service.spec.ts =====
+import { EmployeeImportService } from './employee-import.service';
+
+describe('EmployeeImportService.importRows', () => {
+  const prisma = {
+    employee: {
+      findMany: jest.fn().mockResolvedValue([{ employeeCode: '900042' }]),
+      findFirst: jest.fn().mockResolvedValue(null),
+      create: jest.fn().mockResolvedValue({ id: 'emp-1' }),
+    },
+  };
+
+  it('creates the next code and stores a null email', async () => {
+    const service = new EmployeeImportService(prisma as never);
+    const result = await service.importRows(
+      'tenant-1',
+      '90',
+      [
+        {
+          row: 2,
+          firstName: 'Amir',
+          lastName: 'Mufid',
+          departmentId: 'dept-1',
+          employmentType: 'PERMANENT',
+          email: null,
+          phone: null,
+          joinDate: null,
+        },
+      ],
+      new Set(),
+    );
+
+    expect(result.created).toBe(1);
+    expect(prisma.employee.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          tenantId: 'tenant-1',
+          employeeCode: '900043',
+          email: null,
+          ssoUserId: null,
+          departmentId: 'dept-1',
+          employmentType: 'PERMANENT',
+          status: 'ACTIVE',
+        }),
+      }),
+    );
+  });
+
+  it('records a row failure when the email already exists and continues', async () => {
+    prisma.employee.findFirst.mockResolvedValueOnce({ id: 'existing' });
+    const service = new EmployeeImportService(prisma as never);
+    const result = await service.importRows(
+      'tenant-1',
+      '90',
+      [
+        {
+          row: 2,
+          firstName: 'Amir',
+          lastName: 'Mufid',
+          departmentId: 'dept-1',
+          employmentType: 'PERMANENT',
+          email: 'amir@eiger.test',
+          phone: null,
+          joinDate: '2026-01-15',
+        },
+        {
+          row: 3,
+          firstName: 'Sari',
+          lastName: 'Putri',
+          departmentId: 'dept-1',
+          employmentType: 'INTERN',
+          email: null,
+          phone: null,
+          joinDate: null,
+        },
+      ],
+      new Set(['amir@eiger.test']),
+    );
+
+    expect(result.failed).toBe(1);
+    expect(result.created).toBe(1);
+    expect(result.errors[0].message).toBe('Email sudah dipakai');
+  });
+});
+
+===== untracked backend/src/modules/employees/import/employee-import.service.ts =====
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../../prisma/prisma.service';
+import { jakartaJoinDate } from './employee-import-parser';
+import type { ParsedEmployeeRow } from './employee-import.types';
+import { nextEmployeeCode } from './nik-sequence';
+
+@Injectable()
+export class EmployeeImportService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async importRows(
+    tenantId: string,
+    prefix: string,
+    rows: ParsedEmployeeRow[],
+    existingEmails: Set<string>,
+  ): Promise<{ created: number; failed: number; errors: { row: number; message: string }[] }> {
+    const stored = await this.prisma.employee.findMany({
+      where: {
+        tenantId,
+        employeeCode: { startsWith: prefix },
+      },
+      select: { employeeCode: true },
+    });
+    const existingCodes = stored.map((e) => e.employeeCode);
+
+    let created = 0;
+    let failed = 0;
+    const errors: { row: number; message: string }[] = [];
+
+    for (const row of rows) {
+      if (row.email) {
+        if (existingEmails.has(row.email)) {
+          failed++;
+          errors.push({ row: row.row, message: 'Email sudah dipakai' });
+          continue;
+        }
+        const duplicate = await this.prisma.employee.findFirst({
+          where: { tenantId, email: row.email },
+        });
+        if (duplicate) {
+          failed++;
+          errors.push({ row: row.row, message: 'Email sudah dipakai' });
+          continue;
+        }
+      }
+
+      let employeeCode: string;
+      try {
+        employeeCode = nextEmployeeCode(prefix, existingCodes);
+      } catch (err) {
+        failed++;
+        errors.push({
+          row: row.row,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+
+      const joinDate = row.joinDate
+        ? new Date(`${row.joinDate}T00:00:00.000Z`)
+        : jakartaJoinDate();
+
+      try {
+        await this.prisma.employee.create({
+          data: {
+            tenantId,
+            employeeCode,
+            firstName: row.firstName,
+            lastName: row.lastName,
+            email: row.email,
+            phone: row.phone,
+            departmentId: row.departmentId,
+            employmentType: row.employmentType,
+            joinDate,
+            status: 'ACTIVE',
+            ssoUserId: null,
+          },
+        });
+        existingCodes.push(employeeCode);
+        created++;
+      } catch (err) {
+        failed++;
+        errors.push({
+          row: row.row,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return { created, failed, errors };
+  }
+}
+
+===== untracked backend/src/modules/employees/import/employee-import.types.ts =====
+export const IMPORT_HEADERS = [
+  'Nama depan',
+  'Nama belakang',
+  'Departemen',
+  'Tipe kerja',
+  'Email',
+  'Telepon',
+  'Tanggal bergabung',
+] as const;
+
+export const EMPLOYMENT_TYPES = [
+  'PERMANENT',
+  'CONTRACT',
+  'TEMPORARY',
+  'INTERN',
+  'DAILY_WORKER',
+] as const;
+
+export type EmploymentTypeValue = (typeof EMPLOYMENT_TYPES)[number];
+
+export type ParsedEmployeeRow = {
+  row: number;
+  firstName: string;
+  lastName: string;
+  departmentId: string;
+  employmentType: EmploymentTypeValue;
+  email: string | null;
+  phone: string | null;
+  joinDate: string | null;
+};
+
+export type ImportRowError = { row: number; message: string };
+
+export type EmployeeImportJobData = {
+  tenantId: string;
+  filePath: string;
+  nikPrefix: string;
+};
+
+export type EmployeeImportProgress = {
+  total: number;
+  processed: number;
+  created: number;
+  failed: number;
+  errors: { row: number; message: string }[];
+};
+
+export const EMPTY_IMPORT_PROGRESS: EmployeeImportProgress = {
+  total: 0,
+  processed: 0,
+  created: 0,
+  failed: 0,
+  errors: [],
+};
+
+export function normalizeImportProgress(raw: unknown): EmployeeImportProgress {
+  if (typeof raw !== 'object' || raw === null) {
+    return { ...EMPTY_IMPORT_PROGRESS };
+  }
+  const value = raw as Partial<EmployeeImportProgress>;
+  return {
+    total: value.total ?? 0,
+    processed: value.processed ?? 0,
+    created: value.created ?? 0,
+    failed: value.failed ?? 0,
+    errors: Array.isArray(value.errors) ? value.errors : [],
+  };
+}
+
+===== untracked backend/src/modules/employees/import/nik-sequence.spec.ts =====
+import { assertNikPrefix, nextEmployeeCode } from './nik-sequence';
+
+describe('nik sequence', () => {
+  it('rejects a prefix outside 10-99', () => {
+    expect(() => assertNikPrefix('09')).toThrow('Prefix NIK harus 2 digit dari 10 sampai 99');
+    expect(() => assertNikPrefix('100')).toThrow('Prefix NIK harus 2 digit dari 10 sampai 99');
+  });
+
+  it('starts at 0001 when the prefix has no codes', () => {
+    expect(nextEmployeeCode('90', ['123456', '9012345'])).toBe('900001');
+  });
+
+  it('continues from the highest 6-digit code with that prefix', () => {
+    expect(nextEmployeeCode('90', ['900042', '910001', 'TEMP-1'])).toBe('900043');
+  });
+
+  it('fails when the serial would pass 9999', () => {
+    expect(() => nextEmployeeCode('90', ['909999'])).toThrow(
+      'Nomor urut NIK untuk prefix ini sudah habis',
+    );
+  });
+});
+
+===== untracked backend/src/modules/employees/import/nik-sequence.ts =====
+const PREFIX = /^[1-9]\d$/;
+
+export function assertNikPrefix(prefix: string): string {
+  const value = prefix.trim();
+  if (!PREFIX.test(value)) {
+    throw new Error('Prefix NIK harus 2 digit dari 10 sampai 99');
+  }
+  return value;
+}
+
+export function nextEmployeeCode(prefix: string, existingCodes: string[]): string {
+  const normalized = assertNikPrefix(prefix);
+  let maxSerial = 0;
+  for (const code of existingCodes) {
+    if (!code.startsWith(normalized) || !/^\d{6}$/.test(code)) continue;
+    maxSerial = Math.max(maxSerial, Number(code.slice(2)));
+  }
+  const next = maxSerial + 1;
+  if (next > 9999) {
+    throw new Error('Nomor urut NIK untuk prefix ini sudah habis');
+  }
+  return `${normalized}${String(next).padStart(4, '0')}`;
+}
+
+===== untracked frontend/src/components/employees/EmployeeImportDialog.test.tsx =====
+import { render, screen } from '@testing-library/react';
+import { employeesApi } from '@/lib/api';
+import { EmployeeImportDialog } from './EmployeeImportDialog';
+
+jest.mock('@/lib/api', () => ({
+  employeesApi: {
+    getImportStatus: jest.fn(),
+  },
+}));
+
+const getImportStatus = employeesApi.getImportStatus as jest.Mock;
+
+const activeStatus = {
+  data: {
+    jobId: 'job-1',
+    state: 'active',
+    progress: {
+      total: 10,
+      processed: 4,
+      created: 3,
+      failed: 1,
+      errors: [{ row: 5, message: 'Departemen tidak ditemukan' }],
+    },
+  },
+};
+
+describe('EmployeeImportDialog', () => {
+  beforeEach(() => {
+    getImportStatus.mockResolvedValue(activeStatus);
+  });
+
+  it('shows progress counts from the job status', async () => {
+    render(
+      <EmployeeImportDialog open jobId="job-1" onClose={jest.fn()} onCompleted={jest.fn()} />,
+    );
+
+    expect(await screen.findByText('3 berhasil')).toBeInTheDocument();
+    expect(screen.getByText('1 gagal')).toBeInTheDocument();
+    expect(screen.getByText('Baris 5: Departemen tidak ditemukan')).toBeInTheDocument();
+  });
+
+  it('shows the job failure reason', async () => {
+    getImportStatus.mockResolvedValue({
+      data: {
+        jobId: 'job-1',
+        state: 'failed',
+        failedReason: 'Header sheet Data tidak sesuai template',
+        progress: { total: 0, processed: 0, created: 0, failed: 0, errors: [] },
+      },
+    });
+
+    render(
+      <EmployeeImportDialog open jobId="job-1" onClose={jest.fn()} onCompleted={jest.fn()} />,
+    );
+
+    expect(
+      await screen.findByText('Header sheet Data tidak sesuai template'),
+    ).toBeInTheDocument();
+  });
+
+  it('shows a poll error while progress is open', async () => {
+    getImportStatus.mockRejectedValue(new Error('network'));
+
+    render(
+      <EmployeeImportDialog open jobId="job-1" onClose={jest.fn()} onCompleted={jest.fn()} />,
+    );
+
+    expect(await screen.findByText('Gagal memuat status impor')).toBeInTheDocument();
+  });
+});
+
+===== untracked frontend/src/components/employees/EmployeeImportDialog.tsx =====
+'use client';
+
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import axios from 'axios';
+import { Download, Upload } from 'lucide-react';
+import { Button, FormError, Input, Modal, ModalFooter } from '@/components/ui';
+import { employeesApi } from '@/lib/api';
+import { downloadBlob } from '@/lib/download-blob';
+
+const NIK_PREFIX_REGEX = /^[1-9]\d$/;
+const PREFIX_ERROR = 'Prefix NIK harus 2 digit dari 10 sampai 99';
+
+type ImportJobState = 'waiting' | 'active' | 'completed' | 'failed';
+
+interface ImportProgress {
+  total: number;
+  processed: number;
+  created: number;
+  failed: number;
+  errors: { row: number; message: string }[];
+}
+
+interface ImportStatus {
+  jobId: string;
+  state: ImportJobState;
+  progress: ImportProgress;
+  failedReason?: string;
+}
+
+export interface EmployeeImportDialogProps {
+  open: boolean;
+  jobId: string;
+  onClose: () => void;
+  onCompleted: () => void;
+}
+
+export function EmployeeImportDialog({
+  open,
+  jobId: jobIdProp,
+  onClose,
+  onCompleted,
+}: EmployeeImportDialogProps) {
+  const [nikPrefix, setNikPrefix] = useState('');
+  const [prefixError, setPrefixError] = useState<string | null>(null);
+  const [activeJobId, setActiveJobId] = useState('');
+  const [status, setStatus] = useState<ImportStatus | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [downloadingTemplate, setDownloadingTemplate] = useState(false);
+  const completedNotifiedRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const effectiveJobId = activeJobId || jobIdProp;
+  const showProgress = Boolean(effectiveJobId);
+
+  useEffect(() => {
+    if (!open) {
+      setNikPrefix('');
+      setPrefixError(null);
+      setActiveJobId('');
+      setStatus(null);
+      setUploading(false);
+      setUploadError(null);
+      completedNotifiedRef.current = false;
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || !effectiveJobId) return;
+
+    let cancelled = false;
+    let intervalId: ReturnType<typeof setInterval> | undefined;
+
+    const poll = async () => {
+      try {
+        const response = await employeesApi.getImportStatus(effectiveJobId);
+        if (cancelled) return;
+        const data = response.data as ImportStatus;
+        setStatus(data);
+        setUploadError(null);
+
+        if (data.state === 'completed' || data.state === 'failed') {
+          if (intervalId) clearInterval(intervalId);
+          if (data.state === 'completed' && !completedNotifiedRef.current) {
+            completedNotifiedRef.current = true;
+            onCompleted();
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          setUploadError('Gagal memuat status impor');
+        }
+      }
+    };
+
+    void poll();
+    intervalId = setInterval(() => {
+      void poll();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [open, effectiveJobId, onCompleted]);
+
+  const handleDownloadTemplate = async () => {
+    setDownloadingTemplate(true);
+    try {
+      const response = await employeesApi.downloadImportTemplate();
+      downloadBlob(response.data as Blob, 'template-import-karyawan.xlsx');
+    } catch {
+      setUploadError('Gagal mengunduh template');
+    } finally {
+      setDownloadingTemplate(false);
+    }
+  };
+
+  const validateAndUpload = useCallback(
+    async (file: File) => {
+      if (!NIK_PREFIX_REGEX.test(nikPrefix)) {
+        setPrefixError(PREFIX_ERROR);
+        return;
+      }
+      setPrefixError(null);
+      setUploadError(null);
+      setUploading(true);
+      try {
+        const response = await employeesApi.enqueueImport(file, nikPrefix);
+        setActiveJobId(response.data.jobId);
+      } catch (error) {
+        if (axios.isAxiosError(error) && error.response?.status === 409) {
+          const body = error.response.data as { jobId?: string };
+          if (body?.jobId) {
+            setActiveJobId(body.jobId);
+            return;
+          }
+        }
+        setUploadError('Gagal mengunggah file impor');
+      } finally {
+        setUploading(false);
+      }
+    },
+    [nikPrefix],
+  );
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.xlsx')) {
+      setUploadError('File harus berformat .xlsx');
+      return;
+    }
+    void validateAndUpload(file);
+  };
+
+  const progress = status?.progress;
+  const progressPercent =
+    progress && progress.total > 0
+      ? Math.min(100, Math.round((progress.processed / progress.total) * 100))
+      : 0;
+
+  return (
+    <Modal isOpen={open} onClose={onClose} title="Impor karyawan" size="lg">
+      {showProgress ? (
+        <div className="space-y-4">
+          <div>
+            <div className="flex justify-between text-sm text-warm-600 mb-1">
+              <span>Progress</span>
+              <span>
+                {progress?.processed ?? 0} / {progress?.total ?? 0}
+              </span>
+            </div>
+            <div className="h-2 bg-warm-100 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-primary-500 transition-all duration-300"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
+          </div>
+          <div className="flex gap-4 text-sm">
+            <span className="text-green-700 font-medium">{progress?.created ?? 0} berhasil</span>
+            <span className="text-red-600 font-medium">{progress?.failed ?? 0} gagal</span>
+          </div>
+          {uploadError ? <FormError message={uploadError} /> : null}
+          {status?.state === 'failed' && status.failedReason ? (
+            <p className="text-sm text-red-600">{status.failedReason}</p>
+          ) : null}
+          <ul className="space-y-1 max-h-48 overflow-y-auto">
+            {(progress?.errors ?? []).map((err) => (
+              <li key={`${err.row}-${err.message}`} className="text-sm text-warm-700">
+                Baris {err.row}: {err.message}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <p className="text-sm text-warm-600">
+            Unduh template, isi data karyawan, lalu unggah file Excel (.xlsx).
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void handleDownloadTemplate()}
+            disabled={downloadingTemplate}
+          >
+            <Download className="h-4 w-4 mr-2" />
+            Unduh template
+          </Button>
+          <div>
+            <label className="block text-sm font-medium text-warm-700 mb-1">Prefix NIK (10–99)</label>
+            <Input
+              value={nikPrefix}
+              onChange={(e) => {
+                setNikPrefix(e.target.value);
+                setPrefixError(null);
+              }}
+              placeholder="Contoh: 10"
+              maxLength={2}
+            />
+            {prefixError ? <FormError message={prefixError} /> : null}
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-warm-700 mb-1">File Excel</label>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              className="block w-full text-sm text-warm-600 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-warm-100 file:text-warm-800 hover:file:bg-warm-200"
+              onChange={handleFileChange}
+              disabled={uploading}
+            />
+          </div>
+          {uploadError ? <FormError message={uploadError} /> : null}
+        </div>
+      )}
+      <ModalFooter>
+        <Button type="button" variant="outline" onClick={onClose}>
+          Tutup
+        </Button>
+        {!showProgress ? (
+          <Button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+          >
+            <Upload className="h-4 w-4 mr-2" />
+            {uploading ? 'Mengunggah…' : 'Pilih file'}
+          </Button>
+        ) : null}
+      </ModalFooter>
+    </Modal>
+  );
+}
+
